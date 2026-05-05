@@ -1,0 +1,13 @@
+{
+    "data_path": "data/trajectories.npy",
+    "template_path": "data/analysis/golden_template.npy",
+    "save_dir": "data/models/autoencoder",
+    "random_seed": 42,
+    "val_split": 0.15,
+    "stroke_idx": 0,
+    "device": "auto",
+    "n_epochs": 150,
+    "batch_size": [16, 32, 64],
+    "latent_dim": [32, 64, 128],
+    "lr": [1e-3, 1e-4]
+}
