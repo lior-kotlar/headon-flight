@@ -10,6 +10,7 @@ import itertools
 import json
 import os
 import sys
+from datetime import datetime
 
 import matplotlib
 matplotlib.use('Agg')  # non-interactive backend — safe for headless servers
@@ -23,7 +24,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
-from transform_data import _wingbeat_peaks, _segment_to_sa
+from transform_data import _wingbeat_peaks, _segment_to_sa, _sa_to_segment
 
 class WingbeatEncoder(nn.Module):
     def __init__(self, latent_dim: int, in_channels: int = 6):
@@ -233,6 +234,98 @@ def load_decoder(path: str, device: str = "cpu") -> WingbeatDecoder:
     return decoder
 
 
+def _plot_reconstructed_trajectory(
+    model: WingbeatAutoencoder,
+    val_trajs: list,
+    template: np.ndarray,
+    save_path: str,
+    device: str,
+    n_beats: int = 5,
+    seed: int | None = None,
+) -> None:
+    """
+    Picks n_beats consecutive wingbeats from a random validation trajectory,
+    reconstructs each through the autoencoder, and plots original vs reconstruction
+    vs template as a single continuous signal.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Find a trajectory that has enough consecutive wingbeats
+    candidates = [(traj, _wingbeat_peaks(traj)) for traj in val_trajs]
+    candidates = [(traj, peaks) for traj, peaks in candidates if len(peaks) - 1 >= n_beats]
+
+    if not candidates:
+        print(f"No validation trajectory has {n_beats} consecutive wingbeats — skipping reconstruction plot.", flush=True)
+        return
+
+    traj, peaks = candidates[rng.integers(len(candidates))]
+    max_start   = len(peaks) - 1 - n_beats
+    start_beat  = int(rng.integers(0, max_start + 1))
+
+    model.eval()
+    model.to(device)
+
+    orig_parts, recon_parts, tmpl_parts = [], [], []
+
+    for i in range(start_beat, start_beat + n_beats):
+        start, end = int(peaks[i]), int(peaks[i + 1])
+        segment = traj[start:end]                                    # (n, 6)
+        n       = segment.shape[0]
+
+        # Template matched to this segment length (S=A=0 → hat=0 → output = matched template)
+        tmpl_matched = _sa_to_segment(np.zeros((n, 6), dtype=np.float32), template)
+
+        # Encode → decode
+        sa = _segment_to_sa(segment, template)
+        x  = torch.from_numpy(sa.T).unsqueeze(0).to(device)         # (1, 6, n)
+        with torch.no_grad():
+            recon_sa = model(x).squeeze(0).T.cpu().numpy()           # (n, 6)
+        reconstruction = _sa_to_segment(recon_sa, template)
+
+        orig_parts.append(segment)
+        recon_parts.append(reconstruction)
+        tmpl_parts.append(tmpl_matched)
+
+    original      = np.concatenate(orig_parts,  axis=0)
+    reconstruction = np.concatenate(recon_parts, axis=0)
+    template_line  = np.concatenate(tmpl_parts,  axis=0)
+    x_axis         = np.arange(original.shape[0])
+
+    # Vertical lines at wingbeat boundaries
+    boundaries = np.cumsum([0] + [p.shape[0] for p in orig_parts])
+
+    angle_labels = ['Stroke φ [rad]', 'Deviation θ [rad]', 'Rotation ψ [rad]']
+    left_cols    = [0, 1, 2]
+    right_cols   = [3, 4, 5]
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    fig.suptitle(f"Best Autoencoder — Reconstruction of {n_beats} Consecutive Wingbeats", fontsize=14)
+
+    for ax, label, lc, rc in zip(axes, angle_labels, left_cols, right_cols):
+        ax.plot(x_axis, original[:, lc],        color='blue', lw=2,   ls='-',  label='Left — original')
+        ax.plot(x_axis, reconstruction[:, lc],  color='blue', lw=1.5, ls='--', label='Left — reconstruction')
+        ax.plot(x_axis, template_line[:, lc],   color='blue', lw=1,   ls=':',  alpha=0.5, label='Left — template')
+
+        ax.plot(x_axis, original[:, rc],        color='red',  lw=2,   ls='-',  label='Right — original')
+        ax.plot(x_axis, reconstruction[:, rc],  color='red',  lw=1.5, ls='--', label='Right — reconstruction')
+        ax.plot(x_axis, template_line[:, rc],   color='red',  lw=1,   ls=':',  alpha=0.5, label='Right — template')
+
+        for b in boundaries[1:-1]:
+            ax.axvline(x=b, color='gray', lw=0.8, ls='--', alpha=0.4)
+
+        ax.set_ylabel(label)
+        ax.grid(True, alpha=0.4)
+
+    axes[0].legend(loc='upper right', fontsize=8, ncol=2)
+    axes[2].set_xlabel('Sample Index')
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Reconstruction plot saved → {save_path}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Wingbeat Autoencoder Grid Search")
     parser.add_argument("--config", default="code/autoencoder_config.json", help="Path to JSON config file")
@@ -279,6 +372,12 @@ def main():
     save_dir = fixed.get('save_dir', 'data/models/autoencoder')
     os.makedirs(save_dir, exist_ok=True)
 
+    # One analysis sub-directory per grid-search invocation so plots don't overwrite each other
+    timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    analysis_dir = os.path.join("data/analysis", f"gridsearch_{timestamp}")
+    os.makedirs(analysis_dir, exist_ok=True)
+    print(f"Analysis plots → {analysis_dir}", flush=True)
+
     # --- Grid search ---
     summary              = []
     best_val_loss        = float('inf')
@@ -293,7 +392,7 @@ def main():
         model = WingbeatAutoencoder(latent_dim=run_config['latent_dim'])
 
         run_label = "_".join(f"{k}{v}" for k, v in zip(grid_keys, combo)) if grid_keys else "single"
-        loss_fig_path = os.path.join("data/analysis", f"ae_losses_run{run_idx + 1}_{run_label}.png")
+        loss_fig_path = os.path.join(analysis_dir, f"losses_run{run_idx + 1}_{run_label}.png")
 
         train_losses, val_losses, best_state = train_autoencoder(
             model         = model,
@@ -339,12 +438,25 @@ def main():
     with open(os.path.join(save_dir, 'grid_search_summary.json'), 'w') as f:
         json.dump(sorted(summary, key=lambda r: r['best_val_loss']), f, indent=2)
 
+    # --- Reconstruction plot using the best model across the entire grid search ---
+    best_model = WingbeatAutoencoder(latent_dim=best_run_config['latent_dim'])
+    best_model.load_state_dict(best_autoencoder_state)
+    _plot_reconstructed_trajectory(
+        model      = best_model,
+        val_trajs  = val_trajs,
+        template   = template,
+        save_path  = os.path.join(analysis_dir, "best_model_reconstruction.png"),
+        device     = device,
+        seed       = seed,
+    )
+
     print(f"\n{'=' * 45}")
     print(f"Grid search complete.")
     print(f"Best val loss : {best_val_loss:.6f}")
     if grid_keys:
         print(f"Best config   : {dict(zip(grid_keys, [best_run_config[k] for k in grid_keys]))}")
     print(f"Saved to      : {save_dir}")
+    print(f"Plots saved to: {analysis_dir}")
 
 
 if __name__ == '__main__':

@@ -62,6 +62,70 @@ def _sa_to_segment(sa: np.ndarray, template: np.ndarray) -> np.ndarray:
     return (hat + matched).astype(np.float32)
 
 
+def verify_sa_transform(
+    trajectories: list,
+    template: np.ndarray,
+    save_path: str = "data/analysis/sa_transform_verification.png",
+    seed: int | None = None,
+) -> None:
+    """
+    Picks one random wingbeat, round-trips it through _segment_to_sa → _sa_to_segment,
+    and plots original, reconstruction, and golden template for visual verification.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Collect all valid wingbeats across trajectories
+    candidates = []
+    for traj in trajectories:
+        peaks = _wingbeat_peaks(traj)
+        for i in range(len(peaks) - 1):
+            candidates.append((traj, peaks[i], peaks[i + 1]))
+
+    if not candidates:
+        raise ValueError("No valid wingbeats found in any trajectory.")
+
+    traj, start, end = candidates[rng.integers(len(candidates))]
+    original = traj[start:end]  # (n, 6)
+
+    # Round-trip: forward → inverse
+    sa            = _segment_to_sa(original, template)
+    reconstruction = _sa_to_segment(sa, template)
+
+    # Interpolate template onto the same phase grid as the segment
+    n              = original.shape[0]
+    phase_seg      = np.linspace(0, 1, n)
+    phase_template = np.linspace(0, 1, template.shape[0])
+    matched        = interp1d(phase_template, template, axis=0, kind='cubic')(phase_seg)
+
+    angle_labels = ['Stroke φ [rad]', 'Deviation θ [rad]', 'Rotation ψ [rad]']
+    left_cols    = [0, 1, 2]
+    right_cols   = [3, 4, 5]
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    fig.suptitle("S/A Transform Verification — Original vs Reconstruction vs Template", fontsize=14)
+
+    for ax, label, lc, rc in zip(axes, angle_labels, left_cols, right_cols):
+        ax.plot(phase_seg, original[:, lc],       color='blue', lw=2,   ls='-',  label='Left — original')
+        ax.plot(phase_seg, reconstruction[:, lc], color='blue', lw=1.5, ls='--', label='Left — reconstruction')
+        ax.plot(phase_seg, matched[:, lc],         color='blue', lw=1,   ls=':',  alpha=0.5, label='Left — template')
+
+        ax.plot(phase_seg, original[:, rc],       color='red',  lw=2,   ls='-',  label='Right — original')
+        ax.plot(phase_seg, reconstruction[:, rc], color='red',  lw=1.5, ls='--', label='Right — reconstruction')
+        ax.plot(phase_seg, matched[:, rc],         color='red',  lw=1,   ls=':',  alpha=0.5, label='Right — template')
+
+        ax.set_ylabel(label)
+        ax.grid(True, alpha=0.4)
+
+    axes[0].legend(loc='upper right', fontsize=8, ncol=2)
+    axes[2].set_xlabel('Normalized Phase [0 — 1]')
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"Verification plot saved → {save_path}")
+
+
 def generate_average_wingbeat_template(trajectories, template_res=100, plot_template=True, save_path="data/analysis/golden_template.png"):
     """
     trajectories: List of (N, 6) arrays
@@ -262,6 +326,10 @@ def main() -> None:
 
     np.save(template_path, template)
     logger.info(f"Saved golden template {template.shape} → {template_path}")
+
+    # --- Verify round-trip correctness ---
+    verify_path = os.path.join(os.path.dirname(template_path), "sa_transform_verification.png")
+    verify_sa_transform(trajectories, template, save_path=verify_path)
 
 
 if __name__ == '__main__':
