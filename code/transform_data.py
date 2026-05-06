@@ -26,6 +26,42 @@ def _wingbeat_peaks(traj: np.ndarray) -> np.ndarray:
     return ((left_peaks[:n] + right_peaks[:n]) / 2).astype(int)
 
 
+def _segment_to_sa(segment: np.ndarray, template: np.ndarray) -> np.ndarray:
+    """
+    Converts one wingbeat segment (n, 6) to its S/A representation (n, 6):
+    [S_phi, S_theta, S_psi, A_phi, A_theta, A_psi].
+    """
+    n = segment.shape[0]
+    phase_template = np.linspace(0, 1, template.shape[0])
+    phase_segment  = np.linspace(0, 1, n)
+    matched = interp1d(phase_template, template, axis=0, kind='cubic')(phase_segment)
+    hat = segment - matched
+    S = (hat[:, :3] + hat[:, 3:]) / 2.0
+    A = (hat[:, :3] - hat[:, 3:]) / 2.0
+    return np.concatenate([S, A], axis=1).astype(np.float32)
+
+
+def _sa_to_segment(sa: np.ndarray, template: np.ndarray) -> np.ndarray:
+    """
+    Inverse of _segment_to_sa: converts S/A representation (n, 6) back to
+    wing angles (n, 6) [L_phi, L_theta, L_psi, R_phi, R_theta, R_psi].
+
+    Inverse derivation:
+        S = (hat_L + hat_R) / 2  →  hat_L = S + A
+        A = (hat_L - hat_R) / 2  →  hat_R = S - A
+        wing_angles = [hat_L, hat_R] + matched_template
+    """
+    n = sa.shape[0]
+    phase_template = np.linspace(0, 1, template.shape[0])
+    phase_segment  = np.linspace(0, 1, n)
+    matched = interp1d(phase_template, template, axis=0, kind='cubic')(phase_segment)
+
+    S = sa[:, :3]
+    A = sa[:, 3:]
+    hat = np.concatenate([S + A, S - A], axis=1)
+    return (hat + matched).astype(np.float32)
+
+
 def generate_average_wingbeat_template(trajectories, template_res=100, plot_template=True, save_path="data/analysis/golden_template.png"):
     """
     trajectories: List of (N, 6) arrays
@@ -133,33 +169,9 @@ def transform_to_symmetric_asymmetric(trajectories, template, stroke_idx=0):
         for i in range(len(peaks) - 1):
             start = peaks[i]
             end = peaks[i+1]
-            segment_len = end - start
-            
-            segment = traj[start:end, :]
-            
-            # Interpolate the template to match the current segment's length
-            phase_grid_100 = np.linspace(0, 1, template.shape[0])
-            phase_grid_segment = np.linspace(0, 1, segment_len)
-            
-            f_template = interp1d(phase_grid_100, template, axis=0, kind='cubic')
-            matched_template = f_template(phase_grid_segment)
-            
-            # 1. Subtract template to get the deviations (hat)
-            hat = segment - matched_template
-            
-            # Extract Left: [phi, theta, psi] and Right: [phi, theta, psi]
-            hat_left = hat[:, 0:3]
-            hat_right = hat[:, 3:6]
-            
-            # 2. Compute Symmetric (S) and Asymmetric (A) biases
-            S = (hat_left + hat_right) / 2.0
-            A = (hat_left - hat_right) / 2.0
-            
-            # Store in transformed sequence (shifted by valid_start to fit the array)
             out_start = start - valid_start
-            out_end = end - valid_start
-            transformed_traj[out_start:out_end, 0:3] = S
-            transformed_traj[out_start:out_end, 3:6] = A
+            out_end   = end   - valid_start
+            transformed_traj[out_start:out_end] = _segment_to_sa(traj[start:end], template)
             
         transformed_trajectories.append(transformed_traj)
 

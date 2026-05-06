@@ -4,10 +4,9 @@
     "save_dir": "data/models/autoencoder",
     "random_seed": 42,
     "val_split": 0.15,
-    "stroke_idx": 0,
     "device": "auto",
-    "n_epochs": 150,
-    "batch_size": [16, 32, 64],
-    "latent_dim": [32, 64, 128],
-    "lr": [1e-3, 1e-4]
+    "n_epochs": 100,
+    "batch_size": 64,
+    "latent_dim": 32,
+    "lr": 1e-4
 }

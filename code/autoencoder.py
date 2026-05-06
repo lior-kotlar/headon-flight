@@ -4,13 +4,16 @@ Convolutional Autoencoder for individual wingbeat cycle reconstruction.
 Input/Output shape: (B, 6, n) where 6 channels are [S_phi, S_theta, S_psi, A_phi, A_theta, A_psi]
 and n is the number of time samples in one wingbeat (~61-75).
 """
-
 import argparse
 import copy
 import itertools
 import json
 import os
+import sys
 
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend — safe for headless servers
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,10 +21,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn.utils.rnn import pad_sequence
-from scipy.interpolate import interp1d
 from tqdm import tqdm
 
-from transform_data import _wingbeat_peaks  # Reuse the same peak detection logic for consistency
+from transform_data import _wingbeat_peaks, _segment_to_sa
 
 class WingbeatEncoder(nn.Module):
     def __init__(self, latent_dim: int, in_channels: int = 6):
@@ -97,24 +99,12 @@ class WingbeatDataset(Dataset):
 
     def __init__(self, trajectories: list, template: np.ndarray):
         self.samples = []
-        phase_grid_template = np.linspace(0, 1, template.shape[0])
-
         for traj in trajectories:
             peaks = _wingbeat_peaks(traj)
             for i in range(len(peaks) - 1):
                 start, end = peaks[i], peaks[i + 1]
-                segment = traj[start:end]  # (n, 6)
-                n = end - start
-
-                phase_segment = np.linspace(0, 1, n)
-                matched = interp1d(phase_grid_template, template, axis=0, kind='cubic')(phase_segment)
-
-                hat = segment - matched
-                S = (hat[:, :3] + hat[:, 3:]) / 2.0
-                A = (hat[:, :3] - hat[:, 3:]) / 2.0
-                transformed = np.concatenate([S, A], axis=1).astype(np.float32)  # (n, 6)
-
-                self.samples.append(torch.from_numpy(transformed.T))  # (6, n)
+                sa = _segment_to_sa(traj[start:end], template)  # (n, 6)
+                self.samples.append(torch.from_numpy(sa.T))     # (6, n)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -146,6 +136,7 @@ def train_autoencoder(
     lr: float = 1e-3,
     batch_size: int = 32,
     device: str = "cpu",
+    loss_fig_path: str | None = None,
 ) -> tuple[list[float], list[float], dict]:
     """
     Trains the autoencoder.
@@ -172,7 +163,7 @@ def train_autoencoder(
     for epoch in range(n_epochs):
         model.train()
         total_train = 0.0
-        for x, lengths in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{n_epochs}", leave=False):
+        for x, lengths in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{n_epochs}", leave=False, file=sys.stdout, disable=not sys.stdout.isatty()):
             x = x.to(device)
             loss = _masked_mse(model(x), x, lengths)
             optimizer.zero_grad()
@@ -201,14 +192,31 @@ def train_autoencoder(
             best_monitor = monitor
             best_state = copy.deepcopy(model.state_dict())
 
-        if (epoch + 1) % 10 == 0:
-            msg = f"Epoch {epoch + 1:>4}/{n_epochs}  train={avg_train:.6f}"
-            if avg_val is not None:
-                msg += f"  val={avg_val:.6f}"
-            print(msg)
+        msg = f"Epoch {epoch + 1:>4}/{n_epochs}  train={avg_train:.6f}"
+        if avg_val is not None:
+            msg += f"  val={avg_val:.6f}"
+        print(msg, flush=True)
+
+    if loss_fig_path:
+        _save_loss_figure(train_losses, val_losses, loss_fig_path)
 
     return train_losses, val_losses, best_state
 
+def _save_loss_figure(train_losses: list[float], val_losses: list[float], path: str) -> None:
+    epochs = range(1, len(train_losses) + 1)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(epochs, train_losses, label='Train', linewidth=2)
+    if val_losses:
+        ax.plot(epochs, val_losses, label='Validation', linewidth=2)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('MSE Loss')
+    ax.set_title('Autoencoder Training Loss')
+    ax.legend()
+    ax.grid(True, alpha=0.4)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fig.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Loss curve saved → {path}", flush=True)
 
 def load_decoder(path: str, device: str = "cpu") -> WingbeatDecoder:
     """
@@ -280,9 +288,12 @@ def main():
 
     for run_idx, combo in enumerate(combos):
         run_config = {**fixed, **dict(zip(grid_keys, combo))}
-        print(f"\n--- Run {run_idx + 1}/{n_runs} | {dict(zip(grid_keys, combo))} ---")
+        print(f"\n--- Run {run_idx + 1}/{n_runs} | {dict(zip(grid_keys, combo))} ---", flush=True)
 
         model = WingbeatAutoencoder(latent_dim=run_config['latent_dim'])
+
+        run_label = "_".join(f"{k}{v}" for k, v in zip(grid_keys, combo)) if grid_keys else "single"
+        loss_fig_path = os.path.join("data/analysis", f"ae_losses_run{run_idx + 1}_{run_label}.png")
 
         train_losses, val_losses, best_state = train_autoencoder(
             model         = model,
@@ -292,6 +303,7 @@ def main():
             lr            = run_config.get('lr', 1e-3),
             batch_size    = run_config.get('batch_size', 32),
             device        = device,
+            loss_fig_path = loss_fig_path,
         )
 
         model.load_state_dict(best_state)
