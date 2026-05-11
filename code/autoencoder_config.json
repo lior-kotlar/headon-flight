@@ -6,7 +6,8 @@
     "val_split": 0.15,
     "device": "auto",
     "n_epochs": 100,
-    "batch_size": 64,
-    "latent_dim": [32, 64],
-    "lr": 1e-4
+    "batch_size": [32, 64],
+    "latent_dim": 64,
+    "lr": 1e-4,
+    "activation": ["gelu", "silu"]
 }

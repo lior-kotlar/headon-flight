@@ -26,57 +26,82 @@ from tqdm import tqdm
 
 from transform_data import _wingbeat_peaks, _segment_to_sa, _sa_to_segment
 
+# Architecture constants
+_BASE_CHANNELS  = 256  # channels at the deepest conv layer
+_BOTTLENECK_LEN = 4    # temporal length retained at the encoder bottleneck (was 1)
+
+
+def _make_activation(name: str) -> nn.Module:
+    """Returns a fresh activation module instance for the given name."""
+    table = {
+        'gelu':      nn.GELU,
+        'silu':      nn.SiLU,
+        'swish':     nn.SiLU,
+        'elu':       nn.ELU,
+        'relu':      nn.ReLU,
+        'leakyrelu': nn.LeakyReLU,
+        'mish':      nn.Mish,
+        'tanh':      nn.Tanh,
+    }
+    key = name.lower()
+    if key not in table:
+        raise ValueError(f"Unknown activation '{name}'. Options: {list(table)}")
+    return table[key]()
+
+
 class WingbeatEncoder(nn.Module):
-    def __init__(self, latent_dim: int, in_channels: int = 6):
+    def __init__(self, latent_dim: int, in_channels: int = 6, activation: str = 'gelu'):
         super().__init__()
         self.convs = nn.Sequential(
-            nn.Conv1d(in_channels, 32, kernel_size=5, padding=2),
-            nn.BatchNorm1d(32),
-            nn.ELU(),
-            nn.Conv1d(32, 64, kernel_size=5, padding=2, stride=2),
+            nn.Conv1d(in_channels, 64, kernel_size=5, padding=2),
             nn.BatchNorm1d(64),
-            nn.ELU(),
-            nn.Conv1d(64, 128, kernel_size=3, padding=1, stride=2),
+            _make_activation(activation),
+            nn.Conv1d(64, 128, kernel_size=5, padding=2, stride=2),
             nn.BatchNorm1d(128),
-            nn.ELU(),
+            _make_activation(activation),
+            nn.Conv1d(128, _BASE_CHANNELS, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm1d(_BASE_CHANNELS),
+            _make_activation(activation),
         )
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(128, latent_dim)
+        # Keep _BOTTLENECK_LEN time-steps so the latent layer sees temporal layout
+        self.pool = nn.AdaptiveAvgPool1d(_BOTTLENECK_LEN)
+        self.fc   = nn.Linear(_BASE_CHANNELS * _BOTTLENECK_LEN, latent_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.convs(x)      # (B, 128, ~n/4)
-        x = self.pool(x)       # (B, 128, 1)
-        x = x.squeeze(-1)      # (B, 128)
-        return self.fc(x)      # (B, latent_dim)
+        x = self.convs(x)             # (B, _BASE_CHANNELS, ~n/4)
+        x = self.pool(x)              # (B, _BASE_CHANNELS, _BOTTLENECK_LEN)
+        x = x.flatten(start_dim=1)    # (B, _BASE_CHANNELS * _BOTTLENECK_LEN)
+        return self.fc(x)             # (B, latent_dim)
 
 
 class WingbeatDecoder(nn.Module):
-    def __init__(self, latent_dim: int, out_channels: int = 6):
+    def __init__(self, latent_dim: int, out_channels: int = 6, activation: str = 'gelu'):
         super().__init__()
-        self.fc = nn.Linear(latent_dim, 128)
+        self.fc = nn.Linear(latent_dim, _BASE_CHANNELS * _BOTTLENECK_LEN)
         self.convs = nn.Sequential(
+            nn.Conv1d(_BASE_CHANNELS, 128, kernel_size=5, padding=2),
+            nn.BatchNorm1d(128),
+            _make_activation(activation),
             nn.Conv1d(128, 64, kernel_size=5, padding=2),
             nn.BatchNorm1d(64),
-            nn.ELU(),
-            nn.Conv1d(64, 32, kernel_size=5, padding=2),
-            nn.BatchNorm1d(32),
-            nn.ELU(),
-            nn.Conv1d(32, out_channels, kernel_size=5, padding=2),
+            _make_activation(activation),
+            nn.Conv1d(64, out_channels, kernel_size=5, padding=2),
         )
 
     def forward(self, z: torch.Tensor, target_len: int) -> torch.Tensor:
-        x = self.fc(z)                                                             # (B, 128)
-        x = x.unsqueeze(-1)                                                        # (B, 128, 1)
-        x = F.interpolate(x, size=target_len, mode='linear', align_corners=False)  # (B, 128, n)
-        return self.convs(x)                                                       # (B, 6, n)
+        x = self.fc(z)                                                                    # (B, C*L)
+        x = x.view(x.size(0), _BASE_CHANNELS, _BOTTLENECK_LEN)                            # (B, C, L)
+        x = F.interpolate(x, size=target_len, mode='linear', align_corners=False)         # (B, C, n)
+        return self.convs(x)                                                              # (B, 6, n)
 
 
 class WingbeatAutoencoder(nn.Module):
-    def __init__(self, latent_dim: int = 16, in_channels: int = 6):
+    def __init__(self, latent_dim: int = 16, in_channels: int = 6, activation: str = 'gelu'):
         super().__init__()
-        self.encoder = WingbeatEncoder(latent_dim, in_channels)
-        self.decoder = WingbeatDecoder(latent_dim, in_channels)
+        self.encoder    = WingbeatEncoder(latent_dim, in_channels, activation)
+        self.decoder    = WingbeatDecoder(latent_dim, in_channels, activation)
         self.latent_dim = latent_dim
+        self.activation = activation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         target_len = x.shape[-1]
@@ -228,7 +253,10 @@ def load_decoder(path: str, device: str = "cpu") -> WingbeatDecoder:
         wings = decoder(z, target_len=68)
     """
     ckpt = torch.load(path, map_location=device)
-    decoder = WingbeatDecoder(latent_dim=ckpt['latent_dim'])
+    decoder = WingbeatDecoder(
+        latent_dim=ckpt['latent_dim'],
+        activation=ckpt.get('activation', 'gelu'),
+    )
     decoder.load_state_dict(ckpt['state_dict'])
     decoder.to(device)
     return decoder
@@ -325,6 +353,83 @@ def _plot_reconstructed_trajectory(
     plt.close(fig)
     print(f"Reconstruction plot saved → {save_path}", flush=True)
 
+    # --- Interactive plotly HTML version ---
+    html_path = os.path.splitext(save_path)[0] + ".html"
+    _save_reconstruction_plotly(
+        x_axis, original, reconstruction, template_line, boundaries,
+        angle_labels, left_cols, right_cols, n_beats, html_path,
+    )
+
+def _save_reconstruction_plotly(
+    x_axis: np.ndarray,
+    original: np.ndarray,
+    reconstruction: np.ndarray,
+    template_line: np.ndarray,
+    boundaries: np.ndarray,
+    angle_labels: list,
+    left_cols: list,
+    right_cols: list,
+    n_beats: int,
+    html_path: str,
+) -> None:
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        print("plotly not installed — skipping interactive HTML plot.", flush=True)
+        return
+
+    fig = make_subplots(
+        rows=3, cols=1,
+        shared_xaxes=True,
+        subplot_titles=[a.split(' [')[0] for a in angle_labels],
+        vertical_spacing=0.06,
+    )
+
+    series_specs = [
+        ('Left — original',        'blue', 2.0,  'solid', 1.0),
+        ('Left — reconstruction',  'blue', 1.5,  'dash',  1.0),
+        ('Left — template',        'blue', 1.0,  'dot',   0.5),
+        ('Right — original',       'red',  2.0,  'solid', 1.0),
+        ('Right — reconstruction', 'red',  1.5,  'dash',  1.0),
+        ('Right — template',       'red',  1.0,  'dot',   0.5),
+    ]
+
+    for row, (lc, rc, label) in enumerate(zip(left_cols, right_cols, angle_labels), start=1):
+        series_data = [
+            original[:, lc], reconstruction[:, lc], template_line[:, lc],
+            original[:, rc], reconstruction[:, rc], template_line[:, rc],
+        ]
+        for (name, color, width, dash, opacity), y in zip(series_specs, series_data):
+            fig.add_trace(
+                go.Scatter(
+                    x=x_axis, y=y, mode='lines', name=name,
+                    line=dict(color=color, width=width, dash=dash),
+                    opacity=opacity,
+                    legendgroup=name,
+                    showlegend=(row == 1),  # one legend entry per series, not per subplot
+                ),
+                row=row, col=1,
+            )
+        fig.update_yaxes(title_text=label, row=row, col=1)
+
+    # Wingbeat boundaries as vertical lines on every subplot
+    for b in boundaries[1:-1]:
+        for row in (1, 2, 3):
+            fig.add_vline(x=float(b), line=dict(color='gray', width=1, dash='dash'),
+                          opacity=0.4, row=row, col=1)
+
+    fig.update_xaxes(title_text='Sample Index', row=3, col=1)
+    fig.update_layout(
+        title=f"Best Autoencoder — Reconstruction of {n_beats} Consecutive Wingbeats",
+        height=900, width=1200,
+        hovermode='x unified',
+        template='plotly_white',
+    )
+
+    os.makedirs(os.path.dirname(os.path.abspath(html_path)), exist_ok=True)
+    fig.write_html(html_path, include_plotlyjs='cdn')
+    print(f"Interactive reconstruction plot saved → {html_path}", flush=True)
 
 def main():
     parser = argparse.ArgumentParser(description="Wingbeat Autoencoder Grid Search")
@@ -354,8 +459,9 @@ def main():
     # Split at trajectory level to prevent leakage between wingbeats of the same flight
     n_trajs = len(trajectories)
     n_val   = max(1, int(n_trajs * fixed.get('val_split', 0.15)))
-    perm    = np.random.permutation(n_trajs)
-    val_trajs   = [trajectories[i] for i in perm[:n_val]]
+    perm        = np.random.permutation(n_trajs)
+    val_indices = perm[:n_val].tolist()    # persisted so eval scripts don't accidentally pick a training trajectory
+    val_trajs   = [trajectories[i] for i in val_indices]
     train_trajs = [trajectories[i] for i in perm[n_val:]]
 
     train_dataset = WingbeatDataset(train_trajs, template)
@@ -369,14 +475,20 @@ def main():
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Device: {device}")
 
-    save_dir = fixed.get('save_dir', 'data/models/autoencoder')
+    # Shared timestamp so models and analysis plots from the same run are paired by name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Per-run model directory so previous checkpoints are never overwritten
+    base_save_dir = fixed.get('save_dir', 'data/models/autoencoder')
+    save_dir      = os.path.join(base_save_dir, f"run_{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
 
-    # One analysis sub-directory per grid-search invocation so plots don't overwrite each other
-    timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Matching analysis directory for plots
     analysis_dir = os.path.join("data/analysis", f"gridsearch_{timestamp}")
     os.makedirs(analysis_dir, exist_ok=True)
-    print(f"Analysis plots → {analysis_dir}", flush=True)
+
+    print(f"Models   → {save_dir}",     flush=True)
+    print(f"Analysis → {analysis_dir}", flush=True)
 
     # --- Grid search ---
     summary              = []
@@ -389,7 +501,10 @@ def main():
         run_config = {**fixed, **dict(zip(grid_keys, combo))}
         print(f"\n--- Run {run_idx + 1}/{n_runs} | {dict(zip(grid_keys, combo))} ---", flush=True)
 
-        model = WingbeatAutoencoder(latent_dim=run_config['latent_dim'])
+        model = WingbeatAutoencoder(
+            latent_dim=run_config['latent_dim'],
+            activation=run_config.get('activation', 'gelu'),
+        )
 
         run_label = "_".join(f"{k}{v}" for k, v in zip(grid_keys, combo)) if grid_keys else "single"
         loss_fig_path = os.path.join(analysis_dir, f"losses_run{run_idx + 1}_{run_label}.png")
@@ -420,14 +535,25 @@ def main():
     # --- Persist results ---
 
     # The decoder checkpoint stores everything needed to reconstruct the architecture.
+    best_activation = best_run_config.get('activation', 'gelu')
     torch.save(
-        {'state_dict': best_decoder_state, 'latent_dim': best_run_config['latent_dim'], 'val_loss': best_val_loss},
+        {
+            'state_dict': best_decoder_state,
+            'latent_dim': best_run_config['latent_dim'],
+            'activation': best_activation,
+            'val_loss': best_val_loss,
+        },
         os.path.join(save_dir, 'best_decoder.pt'),
     )
 
     # Full autoencoder in case the encoder is useful later.
     torch.save(
-        {'state_dict': best_autoencoder_state, 'latent_dim': best_run_config['latent_dim'], 'val_loss': best_val_loss},
+        {
+            'state_dict': best_autoencoder_state,
+            'latent_dim': best_run_config['latent_dim'],
+            'activation': best_activation,
+            'val_loss': best_val_loss,
+        },
         os.path.join(save_dir, 'best_autoencoder.pt'),
     )
 
@@ -438,8 +564,22 @@ def main():
     with open(os.path.join(save_dir, 'grid_search_summary.json'), 'w') as f:
         json.dump(sorted(summary, key=lambda r: r['best_val_loss']), f, indent=2)
 
+    # Validation-set membership — needed by any downstream script that wants to plot
+    # reconstructions without leaking training trajectories
+    with open(os.path.join(save_dir, 'val_indices.json'), 'w') as f:
+        json.dump({
+            'val_indices': val_indices,
+            'n_total':     n_trajs,
+            'val_split':   fixed.get('val_split', 0.15),
+            'random_seed': seed,
+            'data_path':   fixed['data_path'],
+        }, f, indent=2)
+
     # --- Reconstruction plot using the best model across the entire grid search ---
-    best_model = WingbeatAutoencoder(latent_dim=best_run_config['latent_dim'])
+    best_model = WingbeatAutoencoder(
+        latent_dim=best_run_config['latent_dim'],
+        activation=best_activation,
+    )
     best_model.load_state_dict(best_autoencoder_state)
     _plot_reconstructed_trajectory(
         model      = best_model,
