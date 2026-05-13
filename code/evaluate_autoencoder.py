@@ -117,6 +117,7 @@ def main() -> None:
     model = WingbeatAutoencoder(
         latent_dim = ckpt['latent_dim'],
         activation = ckpt.get('activation', 'gelu'),
+        dropout    = ckpt.get('dropout', 0.0),
     )
     model.load_state_dict(ckpt['state_dict'])
     model.to(device)

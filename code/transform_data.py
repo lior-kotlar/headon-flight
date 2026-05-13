@@ -278,7 +278,7 @@ def main() -> None:
     parser.add_argument(
         "--template_res",
         type=int,
-        default=100,
+        default=69,
         help="Number of phase points in the golden template (default: 100)",
     )
     parser.add_argument(

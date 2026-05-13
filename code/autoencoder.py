@@ -29,6 +29,21 @@ from transform_data import _wingbeat_peaks, _segment_to_sa, _sa_to_segment
 # Architecture constants
 _BASE_CHANNELS  = 256  # channels at the deepest conv layer
 _BOTTLENECK_LEN = 4    # temporal length retained at the encoder bottleneck (was 1)
+_NORM_GROUPS    = 8    # GroupNorm groups; must divide every conv output channel count (64, 128, 256)
+
+
+def _make_optimizer(name: str, params, lr: float, weight_decay: float = 0.0) -> torch.optim.Optimizer:
+    """Returns an optimizer instance for the given name."""
+    key = name.lower()
+    if key == 'adam':
+        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    if key == 'adamw':
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    if key == 'sgd':
+        return torch.optim.SGD(params, lr=lr, weight_decay=weight_decay, momentum=0.9)
+    if key == 'rmsprop':
+        return torch.optim.RMSprop(params, lr=lr, weight_decay=weight_decay)
+    raise ValueError(f"Unknown optimizer '{name}'. Options: adam, adamw, sgd, rmsprop")
 
 
 def _make_activation(name: str) -> nn.Module:
@@ -50,58 +65,63 @@ def _make_activation(name: str) -> nn.Module:
 
 
 class WingbeatEncoder(nn.Module):
-    def __init__(self, latent_dim: int, in_channels: int = 6, activation: str = 'gelu'):
+    def __init__(self, latent_dim: int, in_channels: int = 6, activation: str = 'gelu', dropout: float = 0.0):
         super().__init__()
         self.convs = nn.Sequential(
             nn.Conv1d(in_channels, 64, kernel_size=5, padding=2),
-            nn.BatchNorm1d(64),
+            nn.GroupNorm(_NORM_GROUPS, 64),
             _make_activation(activation),
             nn.Conv1d(64, 128, kernel_size=5, padding=2, stride=2),
-            nn.BatchNorm1d(128),
+            nn.GroupNorm(_NORM_GROUPS, 128),
             _make_activation(activation),
             nn.Conv1d(128, _BASE_CHANNELS, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm1d(_BASE_CHANNELS),
+            nn.GroupNorm(_NORM_GROUPS, _BASE_CHANNELS),
             _make_activation(activation),
         )
         # Keep _BOTTLENECK_LEN time-steps so the latent layer sees temporal layout
-        self.pool = nn.AdaptiveAvgPool1d(_BOTTLENECK_LEN)
-        self.fc   = nn.Linear(_BASE_CHANNELS * _BOTTLENECK_LEN, latent_dim)
+        self.pool    = nn.AdaptiveAvgPool1d(_BOTTLENECK_LEN)
+        self.dropout = nn.Dropout(dropout)
+        self.fc      = nn.Linear(_BASE_CHANNELS * _BOTTLENECK_LEN, latent_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.convs(x)             # (B, _BASE_CHANNELS, ~n/4)
         x = self.pool(x)              # (B, _BASE_CHANNELS, _BOTTLENECK_LEN)
         x = x.flatten(start_dim=1)    # (B, _BASE_CHANNELS * _BOTTLENECK_LEN)
+        x = self.dropout(x)
         return self.fc(x)             # (B, latent_dim)
 
 
 class WingbeatDecoder(nn.Module):
-    def __init__(self, latent_dim: int, out_channels: int = 6, activation: str = 'gelu'):
+    def __init__(self, latent_dim: int, out_channels: int = 6, activation: str = 'gelu', dropout: float = 0.0):
         super().__init__()
-        self.fc = nn.Linear(latent_dim, _BASE_CHANNELS * _BOTTLENECK_LEN)
+        self.fc      = nn.Linear(latent_dim, _BASE_CHANNELS * _BOTTLENECK_LEN)
+        self.dropout = nn.Dropout(dropout)
         self.convs = nn.Sequential(
             nn.Conv1d(_BASE_CHANNELS, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
+            nn.GroupNorm(_NORM_GROUPS, 128),
             _make_activation(activation),
             nn.Conv1d(128, 64, kernel_size=5, padding=2),
-            nn.BatchNorm1d(64),
+            nn.GroupNorm(_NORM_GROUPS, 64),
             _make_activation(activation),
             nn.Conv1d(64, out_channels, kernel_size=5, padding=2),
         )
 
     def forward(self, z: torch.Tensor, target_len: int) -> torch.Tensor:
         x = self.fc(z)                                                                    # (B, C*L)
+        x = self.dropout(x)
         x = x.view(x.size(0), _BASE_CHANNELS, _BOTTLENECK_LEN)                            # (B, C, L)
         x = F.interpolate(x, size=target_len, mode='linear', align_corners=False)         # (B, C, n)
         return self.convs(x)                                                              # (B, 6, n)
 
 
 class WingbeatAutoencoder(nn.Module):
-    def __init__(self, latent_dim: int = 16, in_channels: int = 6, activation: str = 'gelu'):
+    def __init__(self, latent_dim: int = 16, in_channels: int = 6, activation: str = 'gelu', dropout: float = 0.0):
         super().__init__()
-        self.encoder    = WingbeatEncoder(latent_dim, in_channels, activation)
-        self.decoder    = WingbeatDecoder(latent_dim, in_channels, activation)
+        self.encoder    = WingbeatEncoder(latent_dim, in_channels, activation, dropout)
+        self.decoder    = WingbeatDecoder(latent_dim, in_channels, activation, dropout)
         self.latent_dim = latent_dim
         self.activation = activation
+        self.dropout    = dropout
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         target_len = x.shape[-1]
@@ -163,6 +183,8 @@ def train_autoencoder(
     batch_size: int = 32,
     device: str = "cpu",
     loss_fig_path: str | None = None,
+    optimizer_name: str = 'adam',
+    weight_decay: float = 0.0,
 ) -> tuple[list[float], list[float], dict]:
     """
     Trains the autoencoder.
@@ -178,7 +200,7 @@ def train_autoencoder(
         if val_dataset else None
     )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = _make_optimizer(optimizer_name, model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
 
     model.to(device)
@@ -256,6 +278,7 @@ def load_decoder(path: str, device: str = "cpu") -> WingbeatDecoder:
     decoder = WingbeatDecoder(
         latent_dim=ckpt['latent_dim'],
         activation=ckpt.get('activation', 'gelu'),
+        dropout=ckpt.get('dropout', 0.0),
     )
     decoder.load_state_dict(ckpt['state_dict'])
     decoder.to(device)
@@ -504,20 +527,23 @@ def main():
         model = WingbeatAutoencoder(
             latent_dim=run_config['latent_dim'],
             activation=run_config.get('activation', 'gelu'),
+            dropout=run_config.get('dropout', 0.0),
         )
 
         run_label = "_".join(f"{k}{v}" for k, v in zip(grid_keys, combo)) if grid_keys else "single"
         loss_fig_path = os.path.join(analysis_dir, f"losses_run{run_idx + 1}_{run_label}.png")
 
         train_losses, val_losses, best_state = train_autoencoder(
-            model         = model,
-            train_dataset = train_dataset,
-            val_dataset   = val_dataset,
-            n_epochs      = run_config.get('n_epochs', 100),
-            lr            = run_config.get('lr', 1e-3),
-            batch_size    = run_config.get('batch_size', 32),
-            device        = device,
-            loss_fig_path = loss_fig_path,
+            model          = model,
+            train_dataset  = train_dataset,
+            val_dataset    = val_dataset,
+            n_epochs       = run_config.get('n_epochs', 100),
+            lr             = run_config.get('lr', 1e-3),
+            batch_size     = run_config.get('batch_size', 32),
+            device         = device,
+            loss_fig_path  = loss_fig_path,
+            optimizer_name = run_config.get('optimizer', 'adam'),
+            weight_decay   = run_config.get('weight_decay', 0.0),
         )
 
         model.load_state_dict(best_state)
@@ -536,12 +562,14 @@ def main():
 
     # The decoder checkpoint stores everything needed to reconstruct the architecture.
     best_activation = best_run_config.get('activation', 'gelu')
+    best_dropout    = best_run_config.get('dropout', 0.0)
     torch.save(
         {
             'state_dict': best_decoder_state,
             'latent_dim': best_run_config['latent_dim'],
             'activation': best_activation,
-            'val_loss': best_val_loss,
+            'dropout':    best_dropout,
+            'val_loss':   best_val_loss,
         },
         os.path.join(save_dir, 'best_decoder.pt'),
     )
@@ -552,7 +580,8 @@ def main():
             'state_dict': best_autoencoder_state,
             'latent_dim': best_run_config['latent_dim'],
             'activation': best_activation,
-            'val_loss': best_val_loss,
+            'dropout':    best_dropout,
+            'val_loss':   best_val_loss,
         },
         os.path.join(save_dir, 'best_autoencoder.pt'),
     )
@@ -579,6 +608,7 @@ def main():
     best_model = WingbeatAutoencoder(
         latent_dim=best_run_config['latent_dim'],
         activation=best_activation,
+        dropout=best_dropout,
     )
     best_model.load_state_dict(best_autoencoder_state)
     _plot_reconstructed_trajectory(
