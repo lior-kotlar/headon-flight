@@ -17,6 +17,13 @@ from data_handling.process_data import PROCESSED_TRAIN_FLIGHT_DATA_DIR, _extract
 _L_PHI = 0
 _R_PHI = 3
 
+# Per-channel divisors for normalizing the S/A residual representation to roughly [-1, 1].
+# Mirrors the physical bounds used by PhysicalWingNormalizer on raw angles — stroke φ and
+# rotation ψ scale by π; deviation θ by 0.5 rad. S and A are linear combinations of L and R
+# in the same units, so the same divisor vector applies.
+# Order: [S_phi, S_theta, S_psi, A_phi, A_theta, A_psi]
+SA_PHYSICAL_SCALE = np.array([np.pi, 0.5, np.pi, np.pi, 0.5, np.pi], dtype=np.float32)
+
 
 def _wingbeat_peaks(traj: np.ndarray) -> np.ndarray:
     """Returns wingbeat boundary indices as the average of left and right phi peaks."""

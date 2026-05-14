@@ -24,10 +24,10 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
-from transform_data import _wingbeat_peaks, _segment_to_sa, _sa_to_segment
+from transform_data import _wingbeat_peaks, _segment_to_sa, _sa_to_segment, SA_PHYSICAL_SCALE
 
 # Architecture constants
-_BASE_CHANNELS  = 256  # channels at the deepest conv layer
+_BASE_CHANNELS  = 128  # channels at the deepest conv layer
 _BOTTLENECK_LEN = 4    # temporal length retained at the encoder bottleneck (was 1)
 _NORM_GROUPS    = 8    # GroupNorm groups; must divide every conv output channel count (64, 128, 256)
 
@@ -68,13 +68,13 @@ class WingbeatEncoder(nn.Module):
     def __init__(self, latent_dim: int, in_channels: int = 6, activation: str = 'gelu', dropout: float = 0.0):
         super().__init__()
         self.convs = nn.Sequential(
-            nn.Conv1d(in_channels, 64, kernel_size=5, padding=2),
+            nn.Conv1d(in_channels, 32, kernel_size=5, padding=2, padding_mode='replicate'),
+            nn.GroupNorm(_NORM_GROUPS, 32),
+            _make_activation(activation),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2, stride=2, padding_mode='replicate'),
             nn.GroupNorm(_NORM_GROUPS, 64),
             _make_activation(activation),
-            nn.Conv1d(64, 128, kernel_size=5, padding=2, stride=2),
-            nn.GroupNorm(_NORM_GROUPS, 128),
-            _make_activation(activation),
-            nn.Conv1d(128, _BASE_CHANNELS, kernel_size=3, padding=1, stride=2),
+            nn.Conv1d(64, _BASE_CHANNELS, kernel_size=3, padding=1, stride=2, padding_mode='replicate'),
             nn.GroupNorm(_NORM_GROUPS, _BASE_CHANNELS),
             _make_activation(activation),
         )
@@ -97,13 +97,13 @@ class WingbeatDecoder(nn.Module):
         self.fc      = nn.Linear(latent_dim, _BASE_CHANNELS * _BOTTLENECK_LEN)
         self.dropout = nn.Dropout(dropout)
         self.convs = nn.Sequential(
-            nn.Conv1d(_BASE_CHANNELS, 128, kernel_size=5, padding=2),
-            nn.GroupNorm(_NORM_GROUPS, 128),
-            _make_activation(activation),
-            nn.Conv1d(128, 64, kernel_size=5, padding=2),
+            nn.Conv1d(_BASE_CHANNELS, 64, kernel_size=5, padding=2, padding_mode='replicate'),
             nn.GroupNorm(_NORM_GROUPS, 64),
             _make_activation(activation),
-            nn.Conv1d(64, out_channels, kernel_size=5, padding=2),
+            nn.Conv1d(64, 32, kernel_size=5, padding=2, padding_mode='replicate'),
+            nn.GroupNorm(_NORM_GROUPS, 32),
+            _make_activation(activation),
+            nn.Conv1d(32, out_channels, kernel_size=5, padding=2, padding_mode='replicate'),
         )
 
     def forward(self, z: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -115,17 +115,29 @@ class WingbeatDecoder(nn.Module):
 
 
 class WingbeatAutoencoder(nn.Module):
-    def __init__(self, latent_dim: int = 16, in_channels: int = 6, activation: str = 'gelu', dropout: float = 0.0):
+    def __init__(
+        self,
+        latent_dim: int = 16,
+        in_channels: int = 6,
+        activation: str = 'gelu',
+        dropout: float = 0.0,
+        input_noise_std: float = 0.0,
+    ):
         super().__init__()
-        self.encoder    = WingbeatEncoder(latent_dim, in_channels, activation, dropout)
-        self.decoder    = WingbeatDecoder(latent_dim, in_channels, activation, dropout)
-        self.latent_dim = latent_dim
-        self.activation = activation
-        self.dropout    = dropout
+        self.encoder         = WingbeatEncoder(latent_dim, in_channels, activation, dropout)
+        self.decoder         = WingbeatDecoder(latent_dim, in_channels, activation, dropout)
+        self.latent_dim      = latent_dim
+        self.activation      = activation
+        self.dropout         = dropout
+        self.input_noise_std = input_noise_std
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         target_len = x.shape[-1]
-        z = self.encoder(x)
+        if self.training and self.input_noise_std > 0:
+            x_in = x + torch.randn_like(x) * self.input_noise_std
+        else:
+            x_in = x
+        z = self.encoder(x_in)
         return self.decoder(z, target_len)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -137,20 +149,25 @@ class WingbeatAutoencoder(nn.Module):
 
 class WingbeatDataset(Dataset):
     """
-    Segments continuous flight trajectories into individual wingbeat cycles
-    and applies the S/A transformation relative to a golden template.
+    Segments continuous flight trajectories into individual wingbeat cycles,
+    applies the S/A transformation relative to a golden template, and
+    normalizes by SA_PHYSICAL_SCALE so all 6 channels have comparable range.
 
-    Each sample is a (6, n) tensor: [S_phi, S_theta, S_psi, A_phi, A_theta, A_psi].
+    Each sample is a (6, n) tensor: [S_phi, S_theta, S_psi, A_phi, A_theta, A_psi],
+    normalized to roughly [-1, 1] per channel.
     """
 
     def __init__(self, trajectories: list, template: np.ndarray):
+        # (6, 1) so it broadcasts against (6, n) samples
+        self.scale = torch.from_numpy(SA_PHYSICAL_SCALE).view(6, 1)
         self.samples = []
         for traj in trajectories:
             peaks = _wingbeat_peaks(traj)
             for i in range(len(peaks) - 1):
                 start, end = peaks[i], peaks[i + 1]
                 sa = _segment_to_sa(traj[start:end], template)  # (n, 6)
-                self.samples.append(torch.from_numpy(sa.T))     # (6, n)
+                sample = torch.from_numpy(sa.T)                 # (6, n)
+                self.samples.append(sample / self.scale)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -201,7 +218,7 @@ def train_autoencoder(
     )
 
     optimizer = _make_optimizer(optimizer_name, model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+    scheduler = ReduceLROnPlateau(optimizer, patience=4, factor=0.5)
 
     model.to(device)
     train_losses, val_losses = [], []
@@ -326,12 +343,12 @@ def _plot_reconstructed_trajectory(
         # Template matched to this segment length (S=A=0 → hat=0 → output = matched template)
         tmpl_matched = _sa_to_segment(np.zeros((n, 6), dtype=np.float32), template)
 
-        # Encode → decode
-        sa = _segment_to_sa(segment, template)
-        x  = torch.from_numpy(sa.T).unsqueeze(0).to(device)         # (1, 6, n)
+        # Encode → decode (model operates in SA_PHYSICAL_SCALE-normalized space)
+        sa = _segment_to_sa(segment, template) / SA_PHYSICAL_SCALE   # (n, 6) normalized
+        x  = torch.from_numpy(sa.T).unsqueeze(0).to(device)          # (1, 6, n)
         with torch.no_grad():
-            recon_sa = model(x).squeeze(0).T.cpu().numpy()           # (n, 6)
-        reconstruction = _sa_to_segment(recon_sa, template)
+            recon_sa = model(x).squeeze(0).T.cpu().numpy()           # (n, 6) still normalized
+        reconstruction = _sa_to_segment(recon_sa * SA_PHYSICAL_SCALE, template)
 
         orig_parts.append(segment)
         recon_parts.append(reconstruction)
@@ -528,6 +545,7 @@ def main():
             latent_dim=run_config['latent_dim'],
             activation=run_config.get('activation', 'gelu'),
             dropout=run_config.get('dropout', 0.0),
+            input_noise_std=run_config.get('input_noise_std', 0.0),
         )
 
         run_label = "_".join(f"{k}{v}" for k, v in zip(grid_keys, combo)) if grid_keys else "single"
@@ -561,15 +579,19 @@ def main():
     # --- Persist results ---
 
     # The decoder checkpoint stores everything needed to reconstruct the architecture.
-    best_activation = best_run_config.get('activation', 'gelu')
-    best_dropout    = best_run_config.get('dropout', 0.0)
+    best_activation       = best_run_config.get('activation', 'gelu')
+    best_dropout          = best_run_config.get('dropout', 0.0)
+    best_input_noise_std  = best_run_config.get('input_noise_std', 0.0)
+    # SA scale is included so a loader can recover physical units without re-importing the constant.
+    sa_scale_list = SA_PHYSICAL_SCALE.tolist()
     torch.save(
         {
-            'state_dict': best_decoder_state,
-            'latent_dim': best_run_config['latent_dim'],
-            'activation': best_activation,
-            'dropout':    best_dropout,
-            'val_loss':   best_val_loss,
+            'state_dict':       best_decoder_state,
+            'latent_dim':       best_run_config['latent_dim'],
+            'activation':       best_activation,
+            'dropout':          best_dropout,
+            'sa_scale':         sa_scale_list,
+            'val_loss':         best_val_loss,
         },
         os.path.join(save_dir, 'best_decoder.pt'),
     )
@@ -577,11 +599,13 @@ def main():
     # Full autoencoder in case the encoder is useful later.
     torch.save(
         {
-            'state_dict': best_autoencoder_state,
-            'latent_dim': best_run_config['latent_dim'],
-            'activation': best_activation,
-            'dropout':    best_dropout,
-            'val_loss':   best_val_loss,
+            'state_dict':      best_autoencoder_state,
+            'latent_dim':      best_run_config['latent_dim'],
+            'activation':      best_activation,
+            'dropout':         best_dropout,
+            'input_noise_std': best_input_noise_std,
+            'sa_scale':        sa_scale_list,
+            'val_loss':        best_val_loss,
         },
         os.path.join(save_dir, 'best_autoencoder.pt'),
     )
@@ -609,6 +633,7 @@ def main():
         latent_dim=best_run_config['latent_dim'],
         activation=best_activation,
         dropout=best_dropout,
+        input_noise_std=best_input_noise_std,
     )
     best_model.load_state_dict(best_autoencoder_state)
     _plot_reconstructed_trajectory(
