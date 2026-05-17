@@ -121,23 +121,17 @@ class WingbeatAutoencoder(nn.Module):
         in_channels: int = 6,
         activation: str = 'gelu',
         dropout: float = 0.0,
-        input_noise_std: float = 0.0,
     ):
         super().__init__()
-        self.encoder         = WingbeatEncoder(latent_dim, in_channels, activation, dropout)
-        self.decoder         = WingbeatDecoder(latent_dim, in_channels, activation, dropout)
-        self.latent_dim      = latent_dim
-        self.activation      = activation
-        self.dropout         = dropout
-        self.input_noise_std = input_noise_std
+        self.encoder    = WingbeatEncoder(latent_dim, in_channels, activation, dropout)
+        self.decoder    = WingbeatDecoder(latent_dim, in_channels, activation, dropout)
+        self.latent_dim = latent_dim
+        self.activation = activation
+        self.dropout    = dropout
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         target_len = x.shape[-1]
-        if self.training and self.input_noise_std > 0:
-            x_in = x + torch.randn_like(x) * self.input_noise_std
-        else:
-            x_in = x
-        z = self.encoder(x_in)
+        z = self.encoder(x)
         return self.decoder(z, target_len)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -183,12 +177,28 @@ def _collate_fn(batch: list) -> tuple[torch.Tensor, torch.Tensor]:
     return padded.permute(0, 2, 1).contiguous(), lengths  # (B, 6, max_n), (B,)
 
 
-def _masked_mse(recon: torch.Tensor, target: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-    """MSE computed only over the valid (non-padded) time steps."""
+def _masked_mse(
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    lengths: torch.Tensor,
+    channel_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    MSE computed only over the valid (non-padded) time steps.
+
+    If `channel_weight` is provided (shape (C,)), per-channel squared errors are
+    multiplied by it before averaging. Used to up-weight the A channels so the
+    model can't trivially minimize loss by predicting symmetric (A=0) outputs.
+    Denominator stays `mask.sum()` (unweighted timestep count) so the weight
+    acts as a relative scale across channels, not a re-normalization.
+    """
     mask = torch.zeros_like(target)
     for i, l in enumerate(lengths):
         mask[i, :, :l] = 1.0
-    return F.mse_loss(recon * mask, target * mask, reduction='sum') / mask.sum()
+    sq_err = (recon - target) ** 2 * mask                       # (B, C, T)
+    if channel_weight is not None:
+        sq_err = sq_err * channel_weight.view(1, -1, 1).to(sq_err.device, sq_err.dtype)
+    return sq_err.sum() / mask.sum()
 
 
 def train_autoencoder(
@@ -202,6 +212,7 @@ def train_autoencoder(
     loss_fig_path: str | None = None,
     optimizer_name: str = 'adam',
     weight_decay: float = 0.0,
+    channel_loss_weight: list[float] | None = None,
 ) -> tuple[list[float], list[float], dict]:
     """
     Trains the autoencoder.
@@ -220,6 +231,13 @@ def train_autoencoder(
     optimizer = _make_optimizer(optimizer_name, model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, patience=4, factor=0.5)
 
+    # Tensor form of channel weights, kept on CPU here — `_masked_mse` moves it to the
+    # right device on use. None → unweighted MSE for both train and val.
+    channel_weight_tensor = (
+        torch.as_tensor(channel_loss_weight, dtype=torch.float32)
+        if channel_loss_weight is not None else None
+    )
+
     model.to(device)
     train_losses, val_losses = [], []
     best_monitor = float('inf')
@@ -230,7 +248,7 @@ def train_autoencoder(
         total_train = 0.0
         for x, lengths in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{n_epochs}", leave=False, file=sys.stdout, disable=not sys.stdout.isatty()):
             x = x.to(device)
-            loss = _masked_mse(model(x), x, lengths)
+            loss = _masked_mse(model(x), x, lengths, channel_weight=channel_weight_tensor)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -246,6 +264,8 @@ def train_autoencoder(
             with torch.no_grad():
                 for x, lengths in val_loader:
                     x = x.to(device)
+                    # Val loss is unweighted so it stays comparable across runs with
+                    # different channel_loss_weight settings.
                     total_val += _masked_mse(model(x), x, lengths).item()
             avg_val = total_val / len(val_loader)
             val_losses.append(avg_val)
@@ -474,6 +494,12 @@ def _save_reconstruction_plotly(
 def main():
     parser = argparse.ArgumentParser(description="Wingbeat Autoencoder Grid Search")
     parser.add_argument("--config", default="code/autoencoder_config.json", help="Path to JSON config file")
+    parser.add_argument(
+        "--job_name",
+        default=None,
+        help="Name used as prefix for the per-run model and analysis directories. "
+             "If unset/empty, defaults to 'run' (models) and 'gridsearch' (analysis).",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -518,13 +544,18 @@ def main():
     # Shared timestamp so models and analysis plots from the same run are paired by name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    # Directory prefixes: use the job name if provided, otherwise the original defaults.
+    job_name        = (args.job_name or "").strip()
+    models_prefix   = job_name if job_name else "run"
+    analysis_prefix = job_name if job_name else "gridsearch"
+
     # Per-run model directory so previous checkpoints are never overwritten
     base_save_dir = fixed.get('save_dir', 'data/models/autoencoder')
-    save_dir      = os.path.join(base_save_dir, f"run_{timestamp}")
+    save_dir      = os.path.join(base_save_dir, f"{models_prefix}_{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
 
     # Matching analysis directory for plots
-    analysis_dir = os.path.join("data/analysis", f"gridsearch_{timestamp}")
+    analysis_dir = os.path.join("data/analysis", f"{analysis_prefix}_{timestamp}")
     os.makedirs(analysis_dir, exist_ok=True)
 
     print(f"Models   → {save_dir}",     flush=True)
@@ -545,23 +576,23 @@ def main():
             latent_dim=run_config['latent_dim'],
             activation=run_config.get('activation', 'gelu'),
             dropout=run_config.get('dropout', 0.0),
-            input_noise_std=run_config.get('input_noise_std', 0.0),
         )
 
         run_label = "_".join(f"{k}{v}" for k, v in zip(grid_keys, combo)) if grid_keys else "single"
         loss_fig_path = os.path.join(analysis_dir, f"losses_run{run_idx + 1}_{run_label}.png")
 
         train_losses, val_losses, best_state = train_autoencoder(
-            model          = model,
-            train_dataset  = train_dataset,
-            val_dataset    = val_dataset,
-            n_epochs       = run_config.get('n_epochs', 100),
-            lr             = run_config.get('lr', 1e-3),
-            batch_size     = run_config.get('batch_size', 32),
-            device         = device,
-            loss_fig_path  = loss_fig_path,
-            optimizer_name = run_config.get('optimizer', 'adam'),
-            weight_decay   = run_config.get('weight_decay', 0.0),
+            model               = model,
+            train_dataset       = train_dataset,
+            val_dataset         = val_dataset,
+            n_epochs            = run_config.get('n_epochs', 100),
+            lr                  = run_config.get('lr', 1e-3),
+            batch_size          = run_config.get('batch_size', 32),
+            device              = device,
+            loss_fig_path       = loss_fig_path,
+            optimizer_name      = run_config.get('optimizer', 'adam'),
+            weight_decay        = run_config.get('weight_decay', 0.0),
+            channel_loss_weight = run_config.get('channel_loss_weight'),
         )
 
         model.load_state_dict(best_state)
@@ -579,9 +610,9 @@ def main():
     # --- Persist results ---
 
     # The decoder checkpoint stores everything needed to reconstruct the architecture.
-    best_activation       = best_run_config.get('activation', 'gelu')
-    best_dropout          = best_run_config.get('dropout', 0.0)
-    best_input_noise_std  = best_run_config.get('input_noise_std', 0.0)
+    best_activation          = best_run_config.get('activation', 'gelu')
+    best_dropout             = best_run_config.get('dropout', 0.0)
+    best_channel_loss_weight = best_run_config.get('channel_loss_weight')
     # SA scale is included so a loader can recover physical units without re-importing the constant.
     sa_scale_list = SA_PHYSICAL_SCALE.tolist()
     torch.save(
@@ -599,13 +630,13 @@ def main():
     # Full autoencoder in case the encoder is useful later.
     torch.save(
         {
-            'state_dict':      best_autoencoder_state,
-            'latent_dim':      best_run_config['latent_dim'],
-            'activation':      best_activation,
-            'dropout':         best_dropout,
-            'input_noise_std': best_input_noise_std,
-            'sa_scale':        sa_scale_list,
-            'val_loss':        best_val_loss,
+            'state_dict':          best_autoencoder_state,
+            'latent_dim':          best_run_config['latent_dim'],
+            'activation':          best_activation,
+            'dropout':             best_dropout,
+            'channel_loss_weight': best_channel_loss_weight,
+            'sa_scale':            sa_scale_list,
+            'val_loss':            best_val_loss,
         },
         os.path.join(save_dir, 'best_autoencoder.pt'),
     )
@@ -633,7 +664,6 @@ def main():
         latent_dim=best_run_config['latent_dim'],
         activation=best_activation,
         dropout=best_dropout,
-        input_noise_std=best_input_noise_std,
     )
     best_model.load_state_dict(best_autoencoder_state)
     _plot_reconstructed_trajectory(

@@ -37,6 +37,6 @@ echo "Config File: $CONFIG_PATH"
 echo "Experiment Name: $SLURM_JOB_NAME"
 
 # Execute the autoencoder grid search
-python code/autoencoder.py --config "$CONFIG_PATH"
+python code/autoencoder.py --config "$CONFIG_PATH" --job_name "$SLURM_JOB_NAME"
 
 echo "finished working"
