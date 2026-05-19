@@ -17,7 +17,7 @@
     "cycle_weight": 0.02,
     "endpoint_weight": 5.0,
     "endpoint_samples": 5,
-    "base_channels": 512,
+    "base_channels": [256, 512],
     "derivative_weight": 0.1,
     "bottleneck_len": 12,
     "decoder_kernel_size": 5

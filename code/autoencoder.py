@@ -118,6 +118,15 @@ class WingbeatEncoder(nn.Module):
 
 
 class WingbeatDecoder(nn.Module):
+    """
+    Decoder with a learnable upsampler: two Upsample(scale_factor=2, mode='nearest') +
+    Conv1d blocks (4× temporal expansion), then a final F.interpolate(linear) to handle
+    the fractional remainder up to `target_len`, then the channel-reduction conv stack.
+
+    The nearest+conv pattern avoids the checkerboard artifacts of ConvTranspose1d while
+    keeping the upsampling step learnable — letting the decoder render sharper transitions
+    than piecewise-linear interpolation alone could produce.
+    """
     def __init__(
         self,
         latent_dim: int,
@@ -142,10 +151,23 @@ class WingbeatDecoder(nn.Module):
         self.base_channels  = base_channels
         self.bottleneck_len = bottleneck_len
 
-        kw = decoder_kernel_size
+        kw  = decoder_kernel_size
         pad = kw // 2  # 'same' padding for stride=1
+
         self.fc      = nn.Linear(latent_dim, c3 * bottleneck_len)
         self.dropout = nn.Dropout(dropout)
+
+        # Two learnable upsample stages. Stays at c3 channels so the downstream conv stack
+        # is unchanged. Each stage doubles the temporal dim → 4× total.
+        self.upsampler = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv1d(c3, c3, kernel_size=3, padding=1, padding_mode='replicate'),
+            _make_activation(activation),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv1d(c3, c3, kernel_size=3, padding=1, padding_mode='replicate'),
+            _make_activation(activation),
+        )
+
         self.convs = nn.Sequential(
             nn.Conv1d(c3, c2, kernel_size=kw, padding=pad, padding_mode='replicate'),
             nn.GroupNorm(_NORM_GROUPS, c2),
@@ -160,7 +182,10 @@ class WingbeatDecoder(nn.Module):
         x = self.fc(z)                                                                    # (B, C*L)
         x = self.dropout(x)
         x = x.view(x.size(0), self.base_channels, self.bottleneck_len)                    # (B, C, L)
-        x = F.interpolate(x, size=target_len, mode='linear', align_corners=False)         # (B, C, n)
+        x = self.upsampler(x)                                                             # (B, C, 4L)
+        if x.size(-1) != target_len:
+            # Final fractional step (4L → target_len); typically <1.5× for wingbeats.
+            x = F.interpolate(x, size=target_len, mode='linear', align_corners=False)
         return self.convs(x)                                                              # (B, 6, n)
 
 

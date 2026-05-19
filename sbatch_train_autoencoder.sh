@@ -2,7 +2,7 @@
 #SBATCH --job-name=autoencoder_train
 #SBATCH -o logs/%x_%J.out
 #SBATCH -e logs/%x_%J.err
-#SBATCH --mem=32g
+#SBATCH --mem=256g
 #SBATCH --cpus-per-task=4
 #SBATCH --time=10:00:00
 #SBATCH --gres=gpu:1
