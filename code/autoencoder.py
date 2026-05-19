@@ -277,6 +277,27 @@ def _cycle_consistency_loss(recon: torch.Tensor, lengths: torch.Tensor) -> torch
     return ((first - last) ** 2).mean()
 
 
+def _derivative_loss(recon: torch.Tensor, target: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """
+    MSE between the time-derivatives of recon and target, masked to valid steps.
+
+    Plain MSE is dominated by large smooth features and is nearly blind to small
+    high-frequency wiggles — a reconstruction that smooths them out has tiny extra
+    error. The derivative magnifies high-frequency content (each wiggle adds two
+    opposite-sign diffs), so the model is forced to render it.
+
+    For a wingbeat of valid length `l`, there are `l - 1` valid diff positions.
+    """
+    d_recon  = recon[:, :, 1:] - recon[:, :, :-1]    # (B, C, T-1)
+    d_target = target[:, :, 1:] - target[:, :, :-1]  # (B, C, T-1)
+    mask = torch.zeros_like(d_target)
+    for i, l in enumerate(lengths):
+        v = max(int(l) - 1, 0)
+        mask[i, :, :v] = 1.0
+    sq_err = (d_recon - d_target) ** 2 * mask
+    return sq_err.sum() / mask.sum().clamp(min=1.0)
+
+
 def train_autoencoder(
     model: WingbeatAutoencoder,
     train_dataset: WingbeatDataset,
@@ -292,6 +313,7 @@ def train_autoencoder(
     cycle_weight: float = 0.0,
     endpoint_weight: float = 1.0,
     endpoint_samples: int = 3,
+    derivative_weight: float = 0.0,
 ) -> tuple[list[float], list[float], dict]:
     """
     Trains the autoencoder.
@@ -337,6 +359,8 @@ def train_autoencoder(
             loss = mse
             if cycle_weight > 0.0:
                 loss = loss + cycle_weight * _cycle_consistency_loss(recon, lengths)
+            if derivative_weight > 0.0:
+                loss = loss + derivative_weight * _derivative_loss(recon, x, lengths)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -690,6 +714,7 @@ def main():
             cycle_weight        = run_config.get('cycle_weight', 0.0),
             endpoint_weight     = run_config.get('endpoint_weight', 1.0),
             endpoint_samples    = run_config.get('endpoint_samples', 3),
+            derivative_weight   = run_config.get('derivative_weight', 0.0),
         )
 
         model.load_state_dict(best_state)
@@ -714,6 +739,7 @@ def main():
     best_cycle_weight        = best_run_config.get('cycle_weight', 0.0)
     best_endpoint_weight     = best_run_config.get('endpoint_weight', 1.0)
     best_endpoint_samples    = best_run_config.get('endpoint_samples', 3)
+    best_derivative_weight   = best_run_config.get('derivative_weight', 0.0)
     # SA scale is included so a loader can recover physical units without re-importing the constant.
     sa_scale_list = SA_PHYSICAL_SCALE.tolist()
     torch.save(
@@ -741,6 +767,7 @@ def main():
             'cycle_weight':        best_cycle_weight,
             'endpoint_weight':     best_endpoint_weight,
             'endpoint_samples':    best_endpoint_samples,
+            'derivative_weight':   best_derivative_weight,
             'sa_scale':            sa_scale_list,
             'val_loss':            best_val_loss,
         },

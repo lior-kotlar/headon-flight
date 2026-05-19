@@ -17,5 +17,6 @@
     "cycle_weight": 0.02,
     "endpoint_weight": 5.0,
     "endpoint_samples": 5,
-    "base_channels": 512
+    "base_channels": 512,
+    "derivative_weight": 0.1
 }
