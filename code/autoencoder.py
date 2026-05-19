@@ -28,7 +28,7 @@ from transform_data import _wingbeat_peaks, _segment_to_sa, _sa_to_segment, SA_P
 
 # Architecture constants
 _BASE_CHANNELS  = 128  # channels at the deepest conv layer
-_BOTTLENECK_LEN = 4    # temporal length retained at the encoder bottleneck (was 1)
+_BOTTLENECK_LEN = 8    # temporal length retained at the encoder bottleneck (was 1)
 _NORM_GROUPS    = 8    # GroupNorm groups; must divide every conv output channel count (64, 128, 256)
 
 
@@ -171,34 +171,70 @@ class WingbeatDataset(Dataset):
 
 
 def _collate_fn(batch: list) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pads variable-length wingbeats to the same length within a batch."""
+    """Pads variable-length wingbeats by replicating each sample's last value."""
     lengths = torch.tensor([x.shape[-1] for x in batch])
-    padded = pad_sequence([x.T for x in batch], batch_first=True, padding_value=0.0)
-    return padded.permute(0, 2, 1).contiguous(), lengths  # (B, 6, max_n), (B,)
-
+    max_n   = int(lengths.max())
+    padded  = torch.empty(len(batch), batch[0].shape[0], max_n, dtype=batch[0].dtype)
+    for i, x in enumerate(batch):
+        n = x.shape[-1]
+        padded[i, :, :n] = x
+        if n < max_n:
+            padded[i, :, n:] = x[:, -1:]   # broadcast last sample across the pad
+    return padded, lengths
 
 def _masked_mse(
     recon: torch.Tensor,
     target: torch.Tensor,
     lengths: torch.Tensor,
     channel_weight: torch.Tensor | None = None,
+    endpoint_weight: float = 1.0,
+    endpoint_samples: int = 3,
 ) -> torch.Tensor:
     """
     MSE computed only over the valid (non-padded) time steps.
 
-    If `channel_weight` is provided (shape (C,)), per-channel squared errors are
-    multiplied by it before averaging. Used to up-weight the A channels so the
-    model can't trivially minimize loss by predicting symmetric (A=0) outputs.
-    Denominator stays `mask.sum()` (unweighted timestep count) so the weight
-    acts as a relative scale across channels, not a re-normalization.
+    `channel_weight` (shape (C,)): per-channel multiplier on squared errors.
+        Used to up-weight A channels so the model can't trivially minimize loss
+        by predicting symmetric (A=0) outputs.
+    `endpoint_weight` (scalar): multiplier applied to the first and last
+        `endpoint_samples` valid time-steps of each wingbeat. Forces the model
+        to fit the small-magnitude residuals near the stroke peaks instead of
+        letting them drift. Pass 1.0 to disable.
+
+    Denominator stays `mask.sum()` (unweighted timestep count) so the weights
+    act as relative scales, not re-normalizations.
     """
     mask = torch.zeros_like(target)
+    pos_weight = torch.ones_like(target) if endpoint_weight != 1.0 else None
     for i, l in enumerate(lengths):
-        mask[i, :, :l] = 1.0
+        l_int = int(l)
+        mask[i, :, :l_int] = 1.0
+        if pos_weight is not None:
+            k = min(endpoint_samples, l_int)
+            pos_weight[i, :, :k]              = endpoint_weight
+            pos_weight[i, :, l_int - k:l_int] = endpoint_weight
+
     sq_err = (recon - target) ** 2 * mask                       # (B, C, T)
     if channel_weight is not None:
         sq_err = sq_err * channel_weight.view(1, -1, 1).to(sq_err.device, sq_err.dtype)
+    if pos_weight is not None:
+        sq_err = sq_err * pos_weight
     return sq_err.sum() / mask.sum()
+
+
+def _cycle_consistency_loss(recon: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """
+    Mean squared difference between each wingbeat's first valid sample and its
+    last valid sample, across all channels. Pulls `recon[:, :, 0]` toward
+    `recon[:, :, l-1]` so the reconstructed SA residual is cyclic — and since
+    the template is cyclic by construction, this makes the physical seam between
+    consecutive wingbeats continuous.
+    """
+    batch_size = recon.size(0)
+    last_idx   = (lengths - 1).clamp(min=0).long().to(recon.device)
+    first = recon[:, :, 0]                                                    # (B, C)
+    last  = recon[torch.arange(batch_size, device=recon.device), :, last_idx] # (B, C)
+    return ((first - last) ** 2).mean()
 
 
 def train_autoencoder(
@@ -213,6 +249,9 @@ def train_autoencoder(
     optimizer_name: str = 'adam',
     weight_decay: float = 0.0,
     channel_loss_weight: list[float] | None = None,
+    cycle_weight: float = 0.0,
+    endpoint_weight: float = 1.0,
+    endpoint_samples: int = 3,
 ) -> tuple[list[float], list[float], dict]:
     """
     Trains the autoencoder.
@@ -248,7 +287,16 @@ def train_autoencoder(
         total_train = 0.0
         for x, lengths in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{n_epochs}", leave=False, file=sys.stdout, disable=not sys.stdout.isatty()):
             x = x.to(device)
-            loss = _masked_mse(model(x), x, lengths, channel_weight=channel_weight_tensor)
+            recon = model(x)
+            mse = _masked_mse(
+                recon, x, lengths,
+                channel_weight   = channel_weight_tensor,
+                endpoint_weight  = endpoint_weight,
+                endpoint_samples = endpoint_samples,
+            )
+            loss = mse
+            if cycle_weight > 0.0:
+                loss = loss + cycle_weight * _cycle_consistency_loss(recon, lengths)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -264,8 +312,8 @@ def train_autoencoder(
             with torch.no_grad():
                 for x, lengths in val_loader:
                     x = x.to(device)
-                    # Val loss is unweighted so it stays comparable across runs with
-                    # different channel_loss_weight settings.
+                    # Val loss is unweighted (no channel/endpoint/cycle terms) so it
+                    # stays comparable across runs with different loss-weight settings.
                     total_val += _masked_mse(model(x), x, lengths).item()
             avg_val = total_val / len(val_loader)
             val_losses.append(avg_val)
@@ -346,7 +394,8 @@ def _plot_reconstructed_trajectory(
         print(f"No validation trajectory has {n_beats} consecutive wingbeats — skipping reconstruction plot.", flush=True)
         return
 
-    traj, peaks = candidates[rng.integers(len(candidates))]
+    selected_traj_idx = rng.integers(len(candidates))
+    traj, peaks = candidates[selected_traj_idx]
     max_start   = len(peaks) - 1 - n_beats
     start_beat  = int(rng.integers(0, max_start + 1))
 
@@ -519,21 +568,24 @@ def main():
     torch.manual_seed(seed)
 
     # --- Load data ---
+    # trajectories.npy is treated as the authoritative, already-validated dataset —
+    # garbage filtering is the responsibility of transform_data.py at data-prep time.
     trajectories = np.load(fixed['data_path'], allow_pickle=True)
     template     = np.load(fixed['template_path'])
+    n_trajs      = len(trajectories)
 
     # Split at trajectory level to prevent leakage between wingbeats of the same flight
-    n_trajs = len(trajectories)
-    n_val   = max(1, int(n_trajs * fixed.get('val_split', 0.15)))
+    n_val       = max(1, int(n_trajs * fixed.get('val_split', 0.15)))
     perm        = np.random.permutation(n_trajs)
-    val_indices = perm[:n_val].tolist()    # persisted so eval scripts don't accidentally pick a training trajectory
+    val_indices   = perm[:n_val].tolist()      # persisted so eval scripts don't accidentally pick a training trajectory
+    train_indices = perm[n_val:].tolist()
     val_trajs   = [trajectories[i] for i in val_indices]
-    train_trajs = [trajectories[i] for i in perm[n_val:]]
+    train_trajs = [trajectories[i] for i in train_indices]
 
     train_dataset = WingbeatDataset(train_trajs, template)
     val_dataset   = WingbeatDataset(val_trajs,   template)
 
-    print(f"Trajectories : {len(train_trajs)} train / {n_val} val")
+    print(f"Trajectories : {len(train_trajs)} train / {n_val} val (out of {n_trajs} total)")
     print(f"Wingbeats    : {len(train_dataset)} train / {len(val_dataset)} val")
 
     device = fixed.get('device', 'auto')
@@ -593,6 +645,9 @@ def main():
             optimizer_name      = run_config.get('optimizer', 'adam'),
             weight_decay        = run_config.get('weight_decay', 0.0),
             channel_loss_weight = run_config.get('channel_loss_weight'),
+            cycle_weight        = run_config.get('cycle_weight', 0.0),
+            endpoint_weight     = run_config.get('endpoint_weight', 1.0),
+            endpoint_samples    = run_config.get('endpoint_samples', 3),
         )
 
         model.load_state_dict(best_state)
@@ -613,6 +668,9 @@ def main():
     best_activation          = best_run_config.get('activation', 'gelu')
     best_dropout             = best_run_config.get('dropout', 0.0)
     best_channel_loss_weight = best_run_config.get('channel_loss_weight')
+    best_cycle_weight        = best_run_config.get('cycle_weight', 0.0)
+    best_endpoint_weight     = best_run_config.get('endpoint_weight', 1.0)
+    best_endpoint_samples    = best_run_config.get('endpoint_samples', 3)
     # SA scale is included so a loader can recover physical units without re-importing the constant.
     sa_scale_list = SA_PHYSICAL_SCALE.tolist()
     torch.save(
@@ -635,6 +693,9 @@ def main():
             'activation':          best_activation,
             'dropout':             best_dropout,
             'channel_loss_weight': best_channel_loss_weight,
+            'cycle_weight':        best_cycle_weight,
+            'endpoint_weight':     best_endpoint_weight,
+            'endpoint_samples':    best_endpoint_samples,
             'sa_scale':            sa_scale_list,
             'val_loss':            best_val_loss,
         },
@@ -652,11 +713,12 @@ def main():
     # reconstructions without leaking training trajectories
     with open(os.path.join(save_dir, 'val_indices.json'), 'w') as f:
         json.dump({
-            'val_indices': val_indices,
-            'n_total':     n_trajs,
-            'val_split':   fixed.get('val_split', 0.15),
-            'random_seed': seed,
-            'data_path':   fixed['data_path'],
+            'val_indices':   [int(i) for i in val_indices],
+            'train_indices': [int(i) for i in train_indices],
+            'n_total':       n_trajs,
+            'val_split':     fixed.get('val_split', 0.15),
+            'random_seed':   seed,
+            'data_path':     fixed['data_path'],
         }, f, indent=2)
 
     # --- Reconstruction plot using the best model across the entire grid search ---

@@ -14,7 +14,6 @@ Run from the project root:
 import argparse
 import json
 import os
-from datetime import datetime
 
 import numpy as np
 import torch
@@ -90,9 +89,11 @@ def main() -> None:
         help="Directory containing best_autoencoder.pt, best_config.json, val_indices.json",
     )
     parser.add_argument("--n_beats",  type=int, default=5, help="Number of consecutive wingbeats to plot")
-    parser.add_argument("--seed",     type=int, default=None, help="Random seed for trajectory choice (None = nondeterministic)")
+    parser.add_argument("--seed",     type=int, default=None,
+                        help="Random seed for trajectory choice. If unset, a fresh random seed is drawn "
+                             "and recorded in the output filename so the plot stays reproducible.")
     parser.add_argument("--save_dir", default=None,
-                        help="Where to save plots. Default: data/analysis/eval_<timestamp>/")
+                        help="Where to save plots. Default: the model's own directory (same dir as the checkpoint).")
     args = parser.parse_args()
 
     # Resolve to the latest run_<timestamp>/ if the parent directory was given
@@ -128,14 +129,17 @@ def main() -> None:
     )
 
     # --- Output directory ---
-    if args.save_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir  = os.path.join("data/analysis", f"eval_{timestamp}")
-    else:
-        save_dir = args.save_dir
+    # Default to the model's own directory so plots live alongside the checkpoint they came from.
+    save_dir = args.save_dir if args.save_dir is not None else model_dir
     os.makedirs(save_dir, exist_ok=True)
 
-    save_path = os.path.join(save_dir, "reconstruction.png")
+    # Resolve the seed. If the user didn't pass one, draw a random one and record it so
+    # the filename always carries the seed that produced the plot.
+    seed = args.seed if args.seed is not None else int(np.random.randint(0, 2**31 - 1))
+    if args.seed is None:
+        print(f"No --seed given; using random seed={seed}", flush=True)
+
+    save_path = os.path.join(save_dir, f"reconstruction_seed{seed}.png")
     _plot_reconstructed_trajectory(
         model     = model,
         val_trajs = val_trajs,
@@ -143,7 +147,7 @@ def main() -> None:
         save_path = save_path,
         device    = device,
         n_beats   = args.n_beats,
-        seed      = args.seed,
+        seed      = seed,
     )
     print(f"\nDone. Plots saved in: {save_dir}", flush=True)
 

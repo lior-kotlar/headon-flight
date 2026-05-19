@@ -6,12 +6,15 @@
     "val_split": 0.15,
     "device": "auto",
     "n_epochs": 100,
-    "batch_size": 64,
-    "latent_dim": 12,
+    "batch_size": 32,
+    "latent_dim": 16,
     "lr": 1e-3,
     "activation": "gelu",
     "optimizer": "adamw",
     "weight_decay": 1e-3,
     "dropout": 0.3,
-    "channel_loss_weight": [[3, 3, 3, 10, 10, 10], [5, 5, 5, 15, 15, 15], [3, 3, 3, 15, 15, 15]]
+    "channel_loss_weight": [[3, 3, 3, 10, 10, 10]],
+    "cycle_weight": 0.02,
+    "endpoint_weight": 5.0,
+    "endpoint_samples": 5
 }

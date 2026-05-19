@@ -25,6 +25,23 @@ _R_PHI = 3
 SA_PHYSICAL_SCALE = np.array([np.pi, 0.5, np.pi, np.pi, 0.5, np.pi], dtype=np.float32)
 
 
+def trajectory_asymmetry_score(traj: np.ndarray) -> float:
+    """
+    Per-trajectory L/R asymmetry score. For each angle (phi/theta/psi), computes
+    mean(|L - R|) over all time samples and divides by that angle's physical scale.
+    Returns the max across the 3 angles — one badly-broken angle is enough to flag
+    the trajectory. Used by screen_trajectories.py and by the autoencoder's
+    auto-filter to detect garbage trajectories with unrealistic L-R gaps.
+
+    Column order in `traj`: [L_phi, L_theta, L_psi, R_phi, R_theta, R_psi].
+    """
+    normalized = [
+        float(np.abs(traj[:, lc] - traj[:, rc]).mean()) / float(SA_PHYSICAL_SCALE[lc])
+        for lc, rc in ((0, 3), (1, 4), (2, 5))
+    ]
+    return float(max(normalized))
+
+
 def _wingbeat_peaks(traj: np.ndarray) -> np.ndarray:
     """Returns wingbeat boundary indices as the average of left and right phi peaks."""
     left_peaks,  _ = find_peaks(traj[:, _L_PHI], distance=50)
@@ -298,6 +315,13 @@ def main() -> None:
         action="store_true",
         help="Skip saving the template plot",
     )
+    parser.add_argument(
+        "--asymmetry_max_multiple",
+        type=float,
+        default=10.0,
+        help="Drop trajectories whose L/R asymmetry score exceeds this multiple of the "
+             "dataset median. Set to 0 to disable garbage filtering. Default: 10.0.",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -318,9 +342,34 @@ def main() -> None:
     trajectories = _load_wing_trajectories(PROCESSED_TRAIN_FLIGHT_DATA_DIR, use_radians=not args.no_radians)
     logger.info(f"Loaded {len(trajectories)} trajectories.")
 
+    # --- Drop garbage trajectories by L/R asymmetry score ---
+    # Anything with mean(|L-R|)/scale (max across angles) far above the dataset median
+    # is almost certainly a tracking failure — remove before downstream consumers see it.
+    if args.asymmetry_max_multiple > 0 and len(trajectories) > 0:
+        scores = np.array([trajectory_asymmetry_score(t) for t in trajectories], dtype=np.float64)
+        median_score = float(np.median(scores))
+        if median_score > 0:
+            threshold = args.asymmetry_max_multiple * median_score
+            keep_mask = scores <= threshold
+            n_dropped = int((~keep_mask).sum())
+            if n_dropped > 0:
+                dropped = [(i, float(scores[i])) for i in range(len(scores)) if not keep_mask[i]]
+                logger.info(
+                    f"Asymmetry filter: dropping {n_dropped}/{len(trajectories)} trajectories "
+                    f"with score > {args.asymmetry_max_multiple}× median = {threshold:.4f} "
+                    f"(median = {median_score:.4f})."
+                )
+                logger.info("  Dropped idx → score: " + ", ".join(f"{i}→{s:.3f}" for i, s in dropped))
+                trajectories = [t for t, keep in zip(trajectories, keep_mask) if keep]
+            else:
+                logger.info(
+                    f"Asymmetry filter: no trajectories exceed {args.asymmetry_max_multiple}× median "
+                    f"({threshold:.4f}); nothing dropped."
+                )
+
     # Save as object array so variable-length (N, 6) arrays survive np.load(allow_pickle=True)
     np.save(data_path, np.array(trajectories, dtype=object))
-    logger.info(f"Saved trajectories → {data_path}")
+    logger.info(f"Saved {len(trajectories)} trajectories → {data_path}")
 
     # --- Generate golden template and save both the plot and the .npy ---
     plot_path = os.path.splitext(template_path)[0] + ".png"
