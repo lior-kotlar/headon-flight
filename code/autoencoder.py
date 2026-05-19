@@ -27,9 +27,19 @@ from tqdm import tqdm
 from transform_data import _wingbeat_peaks, _segment_to_sa, _sa_to_segment, SA_PHYSICAL_SCALE
 
 # Architecture constants
-_BASE_CHANNELS  = 128  # channels at the deepest conv layer
-_BOTTLENECK_LEN = 8    # temporal length retained at the encoder bottleneck (was 1)
-_NORM_GROUPS    = 8    # GroupNorm groups; must divide every conv output channel count (64, 128, 256)
+_BASE_CHANNELS  = 128  # default channels at the deepest conv layer; overridable per model
+_BOTTLENECK_LEN = 12    # temporal length retained at the encoder bottleneck
+_NORM_GROUPS    = 8    # GroupNorm groups; must divide every conv output channel count
+
+
+def _validate_base_channels(base_channels: int) -> None:
+    """`base_channels` sets the deepest layer; intermediate layers are base/2 and base/4.
+    All three must be divisible by _NORM_GROUPS for GroupNorm, so base must be a multiple of 4*_NORM_GROUPS."""
+    if base_channels <= 0 or base_channels % (4 * _NORM_GROUPS) != 0:
+        raise ValueError(
+            f"base_channels={base_channels} must be a positive multiple of {4 * _NORM_GROUPS} "
+            f"(smallest layer = base_channels//4 must be divisible by _NORM_GROUPS={_NORM_GROUPS})."
+        )
 
 
 def _make_optimizer(name: str, params, lr: float, weight_decay: float = 0.0) -> torch.optim.Optimizer:
@@ -65,23 +75,37 @@ def _make_activation(name: str) -> nn.Module:
 
 
 class WingbeatEncoder(nn.Module):
-    def __init__(self, latent_dim: int, in_channels: int = 6, activation: str = 'gelu', dropout: float = 0.0):
+    def __init__(
+        self,
+        latent_dim: int,
+        in_channels: int = 6,
+        activation: str = 'gelu',
+        dropout: float = 0.0,
+        base_channels: int = _BASE_CHANNELS,
+    ):
         super().__init__()
+        _validate_base_channels(base_channels)
+        # Channel growth doubles each layer: base/4 → base/2 → base.
+        c1 = base_channels // 4
+        c2 = base_channels // 2
+        c3 = base_channels
+        self.base_channels = base_channels
+
         self.convs = nn.Sequential(
-            nn.Conv1d(in_channels, 32, kernel_size=5, padding=2, padding_mode='replicate'),
-            nn.GroupNorm(_NORM_GROUPS, 32),
+            nn.Conv1d(in_channels, c1, kernel_size=5, padding=2, padding_mode='replicate'),
+            nn.GroupNorm(_NORM_GROUPS, c1),
             _make_activation(activation),
-            nn.Conv1d(32, 64, kernel_size=5, padding=2, stride=2, padding_mode='replicate'),
-            nn.GroupNorm(_NORM_GROUPS, 64),
+            nn.Conv1d(c1, c2, kernel_size=5, padding=2, stride=2, padding_mode='replicate'),
+            nn.GroupNorm(_NORM_GROUPS, c2),
             _make_activation(activation),
-            nn.Conv1d(64, _BASE_CHANNELS, kernel_size=3, padding=1, stride=2, padding_mode='replicate'),
-            nn.GroupNorm(_NORM_GROUPS, _BASE_CHANNELS),
+            nn.Conv1d(c2, c3, kernel_size=3, padding=1, stride=2, padding_mode='replicate'),
+            nn.GroupNorm(_NORM_GROUPS, c3),
             _make_activation(activation),
         )
         # Keep _BOTTLENECK_LEN time-steps so the latent layer sees temporal layout
         self.pool    = nn.AdaptiveAvgPool1d(_BOTTLENECK_LEN)
         self.dropout = nn.Dropout(dropout)
-        self.fc      = nn.Linear(_BASE_CHANNELS * _BOTTLENECK_LEN, latent_dim)
+        self.fc      = nn.Linear(c3 * _BOTTLENECK_LEN, latent_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.convs(x)             # (B, _BASE_CHANNELS, ~n/4)
@@ -92,24 +116,38 @@ class WingbeatEncoder(nn.Module):
 
 
 class WingbeatDecoder(nn.Module):
-    def __init__(self, latent_dim: int, out_channels: int = 6, activation: str = 'gelu', dropout: float = 0.0):
+    def __init__(
+        self,
+        latent_dim: int,
+        out_channels: int = 6,
+        activation: str = 'gelu',
+        dropout: float = 0.0,
+        base_channels: int = _BASE_CHANNELS,
+    ):
         super().__init__()
-        self.fc      = nn.Linear(latent_dim, _BASE_CHANNELS * _BOTTLENECK_LEN)
+        _validate_base_channels(base_channels)
+        # Channel reduction halves each layer: base → base/2 → base/4 → out.
+        c3 = base_channels
+        c2 = base_channels // 2
+        c1 = base_channels // 4
+        self.base_channels = base_channels
+
+        self.fc      = nn.Linear(latent_dim, c3 * _BOTTLENECK_LEN)
         self.dropout = nn.Dropout(dropout)
         self.convs = nn.Sequential(
-            nn.Conv1d(_BASE_CHANNELS, 64, kernel_size=5, padding=2, padding_mode='replicate'),
-            nn.GroupNorm(_NORM_GROUPS, 64),
+            nn.Conv1d(c3, c2, kernel_size=5, padding=2, padding_mode='replicate'),
+            nn.GroupNorm(_NORM_GROUPS, c2),
             _make_activation(activation),
-            nn.Conv1d(64, 32, kernel_size=5, padding=2, padding_mode='replicate'),
-            nn.GroupNorm(_NORM_GROUPS, 32),
+            nn.Conv1d(c2, c1, kernel_size=5, padding=2, padding_mode='replicate'),
+            nn.GroupNorm(_NORM_GROUPS, c1),
             _make_activation(activation),
-            nn.Conv1d(32, out_channels, kernel_size=5, padding=2, padding_mode='replicate'),
+            nn.Conv1d(c1, out_channels, kernel_size=5, padding=2, padding_mode='replicate'),
         )
 
     def forward(self, z: torch.Tensor, target_len: int) -> torch.Tensor:
         x = self.fc(z)                                                                    # (B, C*L)
         x = self.dropout(x)
-        x = x.view(x.size(0), _BASE_CHANNELS, _BOTTLENECK_LEN)                            # (B, C, L)
+        x = x.view(x.size(0), self.base_channels, _BOTTLENECK_LEN)                        # (B, C, L)
         x = F.interpolate(x, size=target_len, mode='linear', align_corners=False)         # (B, C, n)
         return self.convs(x)                                                              # (B, 6, n)
 
@@ -121,13 +159,15 @@ class WingbeatAutoencoder(nn.Module):
         in_channels: int = 6,
         activation: str = 'gelu',
         dropout: float = 0.0,
+        base_channels: int = _BASE_CHANNELS,
     ):
         super().__init__()
-        self.encoder    = WingbeatEncoder(latent_dim, in_channels, activation, dropout)
-        self.decoder    = WingbeatDecoder(latent_dim, in_channels, activation, dropout)
-        self.latent_dim = latent_dim
-        self.activation = activation
-        self.dropout    = dropout
+        self.encoder       = WingbeatEncoder(latent_dim, in_channels, activation, dropout, base_channels)
+        self.decoder       = WingbeatDecoder(latent_dim, in_channels, activation, dropout, base_channels)
+        self.latent_dim    = latent_dim
+        self.activation    = activation
+        self.dropout       = dropout
+        self.base_channels = base_channels
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         target_len = x.shape[-1]
@@ -364,6 +404,7 @@ def load_decoder(path: str, device: str = "cpu") -> WingbeatDecoder:
         latent_dim=ckpt['latent_dim'],
         activation=ckpt.get('activation', 'gelu'),
         dropout=ckpt.get('dropout', 0.0),
+        base_channels=ckpt.get('base_channels', _BASE_CHANNELS),
     )
     decoder.load_state_dict(ckpt['state_dict'])
     decoder.to(device)
@@ -628,6 +669,7 @@ def main():
             latent_dim=run_config['latent_dim'],
             activation=run_config.get('activation', 'gelu'),
             dropout=run_config.get('dropout', 0.0),
+            base_channels=run_config.get('base_channels', _BASE_CHANNELS),
         )
 
         run_label = "_".join(f"{k}{v}" for k, v in zip(grid_keys, combo)) if grid_keys else "single"
@@ -667,6 +709,7 @@ def main():
     # The decoder checkpoint stores everything needed to reconstruct the architecture.
     best_activation          = best_run_config.get('activation', 'gelu')
     best_dropout             = best_run_config.get('dropout', 0.0)
+    best_base_channels       = best_run_config.get('base_channels', _BASE_CHANNELS)
     best_channel_loss_weight = best_run_config.get('channel_loss_weight')
     best_cycle_weight        = best_run_config.get('cycle_weight', 0.0)
     best_endpoint_weight     = best_run_config.get('endpoint_weight', 1.0)
@@ -679,6 +722,7 @@ def main():
             'latent_dim':       best_run_config['latent_dim'],
             'activation':       best_activation,
             'dropout':          best_dropout,
+            'base_channels':    best_base_channels,
             'sa_scale':         sa_scale_list,
             'val_loss':         best_val_loss,
         },
@@ -692,6 +736,7 @@ def main():
             'latent_dim':          best_run_config['latent_dim'],
             'activation':          best_activation,
             'dropout':             best_dropout,
+            'base_channels':       best_base_channels,
             'channel_loss_weight': best_channel_loss_weight,
             'cycle_weight':        best_cycle_weight,
             'endpoint_weight':     best_endpoint_weight,
@@ -726,6 +771,7 @@ def main():
         latent_dim=best_run_config['latent_dim'],
         activation=best_activation,
         dropout=best_dropout,
+        base_channels=best_base_channels,
     )
     best_model.load_state_dict(best_autoencoder_state)
     _plot_reconstructed_trajectory(

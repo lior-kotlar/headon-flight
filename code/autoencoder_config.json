@@ -16,5 +16,6 @@
     "channel_loss_weight": [[3, 3, 3, 10, 10, 10]],
     "cycle_weight": 0.02,
     "endpoint_weight": 5.0,
-    "endpoint_samples": 5
+    "endpoint_samples": 5,
+    "base_channels": 512
 }
