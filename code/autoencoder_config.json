@@ -2,7 +2,7 @@
     "data_path": "data/trajectories.npy",
     "template_path": "data/analysis/golden_template.npy",
     "save_dir": "data/models/autoencoder",
-    "random_seed": 42,
+    "random_seed": [42, 123, 456, 789, 101112],
     "val_split": 0.15,
     "device": "auto",
     "n_epochs": 100,
@@ -13,10 +13,12 @@
     "optimizer": "adamw",
     "weight_decay": 1e-3,
     "dropout": 0.3,
-    "channel_loss_weight": [[3, 3, 3, 10, 10, 10]],
+    "channel_loss_weight": [3, 10],
     "cycle_weight": 0.02,
     "endpoint_weight": 5.0,
     "endpoint_samples": 5,
     "base_channels": 512,
-    "derivative_weight": 0.1
+    "derivative_weight": 0.1,
+    "bottleneck_len": 12,
+    "decoder_kernel_size": 5
 }

@@ -82,6 +82,7 @@ class WingbeatEncoder(nn.Module):
         activation: str = 'gelu',
         dropout: float = 0.0,
         base_channels: int = _BASE_CHANNELS,
+        bottleneck_len: int = _BOTTLENECK_LEN,
     ):
         super().__init__()
         _validate_base_channels(base_channels)
@@ -89,7 +90,8 @@ class WingbeatEncoder(nn.Module):
         c1 = base_channels // 4
         c2 = base_channels // 2
         c3 = base_channels
-        self.base_channels = base_channels
+        self.base_channels  = base_channels
+        self.bottleneck_len = bottleneck_len
 
         self.convs = nn.Sequential(
             nn.Conv1d(in_channels, c1, kernel_size=5, padding=2, padding_mode='replicate'),
@@ -102,10 +104,10 @@ class WingbeatEncoder(nn.Module):
             nn.GroupNorm(_NORM_GROUPS, c3),
             _make_activation(activation),
         )
-        # Keep _BOTTLENECK_LEN time-steps so the latent layer sees temporal layout
-        self.pool    = nn.AdaptiveAvgPool1d(_BOTTLENECK_LEN)
+        # Pool to bottleneck_len time-steps so the latent layer sees temporal layout
+        self.pool    = nn.AdaptiveAvgPool1d(bottleneck_len)
         self.dropout = nn.Dropout(dropout)
-        self.fc      = nn.Linear(c3 * _BOTTLENECK_LEN, latent_dim)
+        self.fc      = nn.Linear(c3 * bottleneck_len, latent_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.convs(x)             # (B, _BASE_CHANNELS, ~n/4)
@@ -123,31 +125,41 @@ class WingbeatDecoder(nn.Module):
         activation: str = 'gelu',
         dropout: float = 0.0,
         base_channels: int = _BASE_CHANNELS,
+        bottleneck_len: int = _BOTTLENECK_LEN,
+        decoder_kernel_size: int = 5,
     ):
         super().__init__()
         _validate_base_channels(base_channels)
+        if decoder_kernel_size < 1 or decoder_kernel_size % 2 == 0:
+            raise ValueError(
+                f"decoder_kernel_size={decoder_kernel_size} must be a positive odd integer "
+                "so 'same' padding is well-defined."
+            )
         # Channel reduction halves each layer: base → base/2 → base/4 → out.
         c3 = base_channels
         c2 = base_channels // 2
         c1 = base_channels // 4
-        self.base_channels = base_channels
+        self.base_channels  = base_channels
+        self.bottleneck_len = bottleneck_len
 
-        self.fc      = nn.Linear(latent_dim, c3 * _BOTTLENECK_LEN)
+        kw = decoder_kernel_size
+        pad = kw // 2  # 'same' padding for stride=1
+        self.fc      = nn.Linear(latent_dim, c3 * bottleneck_len)
         self.dropout = nn.Dropout(dropout)
         self.convs = nn.Sequential(
-            nn.Conv1d(c3, c2, kernel_size=5, padding=2, padding_mode='replicate'),
+            nn.Conv1d(c3, c2, kernel_size=kw, padding=pad, padding_mode='replicate'),
             nn.GroupNorm(_NORM_GROUPS, c2),
             _make_activation(activation),
-            nn.Conv1d(c2, c1, kernel_size=5, padding=2, padding_mode='replicate'),
+            nn.Conv1d(c2, c1, kernel_size=kw, padding=pad, padding_mode='replicate'),
             nn.GroupNorm(_NORM_GROUPS, c1),
             _make_activation(activation),
-            nn.Conv1d(c1, out_channels, kernel_size=5, padding=2, padding_mode='replicate'),
+            nn.Conv1d(c1, out_channels, kernel_size=kw, padding=pad, padding_mode='replicate'),
         )
 
     def forward(self, z: torch.Tensor, target_len: int) -> torch.Tensor:
         x = self.fc(z)                                                                    # (B, C*L)
         x = self.dropout(x)
-        x = x.view(x.size(0), self.base_channels, _BOTTLENECK_LEN)                        # (B, C, L)
+        x = x.view(x.size(0), self.base_channels, self.bottleneck_len)                    # (B, C, L)
         x = F.interpolate(x, size=target_len, mode='linear', align_corners=False)         # (B, C, n)
         return self.convs(x)                                                              # (B, 6, n)
 
@@ -160,14 +172,22 @@ class WingbeatAutoencoder(nn.Module):
         activation: str = 'gelu',
         dropout: float = 0.0,
         base_channels: int = _BASE_CHANNELS,
+        bottleneck_len: int = _BOTTLENECK_LEN,
+        decoder_kernel_size: int = 5,
     ):
         super().__init__()
-        self.encoder       = WingbeatEncoder(latent_dim, in_channels, activation, dropout, base_channels)
-        self.decoder       = WingbeatDecoder(latent_dim, in_channels, activation, dropout, base_channels)
-        self.latent_dim    = latent_dim
-        self.activation    = activation
-        self.dropout       = dropout
-        self.base_channels = base_channels
+        self.encoder = WingbeatEncoder(
+            latent_dim, in_channels, activation, dropout, base_channels, bottleneck_len,
+        )
+        self.decoder = WingbeatDecoder(
+            latent_dim, in_channels, activation, dropout, base_channels, bottleneck_len, decoder_kernel_size,
+        )
+        self.latent_dim          = latent_dim
+        self.activation          = activation
+        self.dropout             = dropout
+        self.base_channels       = base_channels
+        self.bottleneck_len      = bottleneck_len
+        self.decoder_kernel_size = decoder_kernel_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         target_len = x.shape[-1]
@@ -309,7 +329,7 @@ def train_autoencoder(
     loss_fig_path: str | None = None,
     optimizer_name: str = 'adam',
     weight_decay: float = 0.0,
-    channel_loss_weight: list[float] | None = None,
+    channel_loss_weight: tuple[float, float] | list[float] | None = None,  # (alpha_s, alpha_a)
     cycle_weight: float = 0.0,
     endpoint_weight: float = 1.0,
     endpoint_samples: int = 3,
@@ -332,12 +352,20 @@ def train_autoencoder(
     optimizer = _make_optimizer(optimizer_name, model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, patience=4, factor=0.5)
 
-    # Tensor form of channel weights, kept on CPU here — `_masked_mse` moves it to the
-    # right device on use. None → unweighted MSE for both train and val.
-    channel_weight_tensor = (
-        torch.as_tensor(channel_loss_weight, dtype=torch.float32)
-        if channel_loss_weight is not None else None
-    )
+    # channel_loss_weight is now (alpha_s, alpha_a): a 2-tuple that the code broadcasts to
+    # the 6 channels [S_phi, S_theta, S_psi, A_phi, A_theta, A_psi] as [αs, αs, αs, αa, αa, αa].
+    # None or all-ones → unweighted MSE.
+    channel_weight_tensor = None
+    if channel_loss_weight is not None:
+        if len(channel_loss_weight) != 2:
+            raise ValueError(
+                f"channel_loss_weight must be a 2-element sequence (alpha_s, alpha_a); "
+                f"got {channel_loss_weight}"
+            )
+        alpha_s, alpha_a = float(channel_loss_weight[0]), float(channel_loss_weight[1])
+        channel_weight_tensor = torch.tensor(
+            [alpha_s, alpha_s, alpha_s, alpha_a, alpha_a, alpha_a], dtype=torch.float32,
+        )
 
     model.to(device)
     train_losses, val_losses = [], []
@@ -429,6 +457,8 @@ def load_decoder(path: str, device: str = "cpu") -> WingbeatDecoder:
         activation=ckpt.get('activation', 'gelu'),
         dropout=ckpt.get('dropout', 0.0),
         base_channels=ckpt.get('base_channels', _BASE_CHANNELS),
+        bottleneck_len=ckpt.get('bottleneck_len', _BOTTLENECK_LEN),
+        decoder_kernel_size=ckpt.get('decoder_kernel_size', 5),
     )
     decoder.load_state_dict(ckpt['state_dict'])
     decoder.to(device)
@@ -620,8 +650,20 @@ def main():
         raw_config = json.load(f)
 
     # Keys whose values are lists are grid-searched; all others are fixed across every run.
-    fixed = {k: v for k, v in raw_config.items() if not isinstance(v, list)}
-    grid  = {k: v for k, v in raw_config.items() if isinstance(v, list)}
+    # Some keys hold *complex* values (lists/tuples) as a single unit — for those, a bare
+    # list-of-scalars is a single value, while a list-of-lists is a grid over multiple values.
+    # Add entries here when adding new config keys that hold a list value.
+    COMPLEX_VALUE_KEYS = {'channel_loss_weight'}  # value is (alpha_s, alpha_a)
+
+    fixed: dict = {}
+    grid:  dict = {}
+    for k, v in raw_config.items():
+        if k in COMPLEX_VALUE_KEYS:
+            # A bare list-of-scalars is a single value; only a list-of-lists is a grid.
+            is_grid = isinstance(v, list) and len(v) > 0 and isinstance(v[0], (list, tuple))
+        else:
+            is_grid = isinstance(v, list)
+        (grid if is_grid else fixed)[k] = v
 
     grid_keys = list(grid.keys())
     combos    = list(itertools.product(*grid.values()))
@@ -694,6 +736,8 @@ def main():
             activation=run_config.get('activation', 'gelu'),
             dropout=run_config.get('dropout', 0.0),
             base_channels=run_config.get('base_channels', _BASE_CHANNELS),
+            bottleneck_len=run_config.get('bottleneck_len', _BOTTLENECK_LEN),
+            decoder_kernel_size=run_config.get('decoder_kernel_size', 5),
         )
 
         run_label = "_".join(f"{k}{v}" for k, v in zip(grid_keys, combo)) if grid_keys else "single"
@@ -735,6 +779,8 @@ def main():
     best_activation          = best_run_config.get('activation', 'gelu')
     best_dropout             = best_run_config.get('dropout', 0.0)
     best_base_channels       = best_run_config.get('base_channels', _BASE_CHANNELS)
+    best_bottleneck_len      = best_run_config.get('bottleneck_len', _BOTTLENECK_LEN)
+    best_decoder_kernel_size = best_run_config.get('decoder_kernel_size', 5)
     best_channel_loss_weight = best_run_config.get('channel_loss_weight')
     best_cycle_weight        = best_run_config.get('cycle_weight', 0.0)
     best_endpoint_weight     = best_run_config.get('endpoint_weight', 1.0)
@@ -744,13 +790,15 @@ def main():
     sa_scale_list = SA_PHYSICAL_SCALE.tolist()
     torch.save(
         {
-            'state_dict':       best_decoder_state,
-            'latent_dim':       best_run_config['latent_dim'],
-            'activation':       best_activation,
-            'dropout':          best_dropout,
-            'base_channels':    best_base_channels,
-            'sa_scale':         sa_scale_list,
-            'val_loss':         best_val_loss,
+            'state_dict':          best_decoder_state,
+            'latent_dim':          best_run_config['latent_dim'],
+            'activation':          best_activation,
+            'dropout':             best_dropout,
+            'base_channels':       best_base_channels,
+            'bottleneck_len':      best_bottleneck_len,
+            'decoder_kernel_size': best_decoder_kernel_size,
+            'sa_scale':            sa_scale_list,
+            'val_loss':            best_val_loss,
         },
         os.path.join(save_dir, 'best_decoder.pt'),
     )
@@ -768,6 +816,8 @@ def main():
             'endpoint_weight':     best_endpoint_weight,
             'endpoint_samples':    best_endpoint_samples,
             'derivative_weight':   best_derivative_weight,
+            'bottleneck_len':      best_bottleneck_len,
+            'decoder_kernel_size': best_decoder_kernel_size,
             'sa_scale':            sa_scale_list,
             'val_loss':            best_val_loss,
         },
@@ -799,6 +849,8 @@ def main():
         activation=best_activation,
         dropout=best_dropout,
         base_channels=best_base_channels,
+        bottleneck_len=best_bottleneck_len,
+        decoder_kernel_size=best_decoder_kernel_size,
     )
     best_model.load_state_dict(best_autoencoder_state)
     _plot_reconstructed_trajectory(
