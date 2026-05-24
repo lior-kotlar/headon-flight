@@ -119,9 +119,9 @@ def main() -> None:
         latent_dim          = ckpt['latent_dim'],
         activation          = ckpt.get('activation', 'gelu'),
         dropout             = ckpt.get('dropout', 0.0),
-        base_channels       = ckpt.get('base_channels', 128),      # legacy default
-        bottleneck_len      = ckpt.get('bottleneck_len', 12),      # legacy default
-        decoder_kernel_size = ckpt.get('decoder_kernel_size', 5),  # legacy default
+        base_channels       = ckpt.get('base_channels', 128),       # legacy default
+        bottleneck_len      = ckpt.get('bottleneck_len', 12),       # legacy default
+        decoder_kernel_size = ckpt.get('decoder_kernel_size', 5),   # legacy default
     )
     model.load_state_dict(ckpt['state_dict'])
     model.to(device)

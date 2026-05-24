@@ -75,6 +75,13 @@ def _make_activation(name: str) -> nn.Module:
 
 
 class WingbeatEncoder(nn.Module):
+    """
+    Dilated 1D-conv encoder. Channels double each layer (base/4 → base/2 → base).
+    Stride-1 dilated convs (dilation 1, 2, 4) preserve full temporal resolution through
+    the conv stack — high-frequency content reaches the pool intact. Receptive field in
+    input coordinates is ~21 samples, same as a strided version. The final AdaptiveAvgPool
+    reduces to `bottleneck_len`.
+    """
     def __init__(
         self,
         latent_dim: int,
@@ -86,46 +93,47 @@ class WingbeatEncoder(nn.Module):
     ):
         super().__init__()
         _validate_base_channels(base_channels)
-        # Channel growth doubles each layer: base/4 → base/2 → base.
         c1 = base_channels // 4
         c2 = base_channels // 2
         c3 = base_channels
         self.base_channels  = base_channels
         self.bottleneck_len = bottleneck_len
 
+        # For kernel=k, dilation=d, stride=1, 'same' padding is d*(k-1)//2.
         self.convs = nn.Sequential(
             nn.Conv1d(in_channels, c1, kernel_size=5, padding=2, padding_mode='replicate'),
             nn.GroupNorm(_NORM_GROUPS, c1),
             _make_activation(activation),
-            nn.Conv1d(c1, c2, kernel_size=5, padding=2, stride=2, padding_mode='replicate'),
+            nn.Conv1d(c1, c2, kernel_size=5, padding=4, dilation=2, padding_mode='replicate'),
             nn.GroupNorm(_NORM_GROUPS, c2),
             _make_activation(activation),
-            nn.Conv1d(c2, c3, kernel_size=3, padding=1, stride=2, padding_mode='replicate'),
+            nn.Conv1d(c2, c3, kernel_size=3, padding=4, dilation=4, padding_mode='replicate'),
             nn.GroupNorm(_NORM_GROUPS, c3),
             _make_activation(activation),
         )
-        # Pool to bottleneck_len time-steps so the latent layer sees temporal layout
+
         self.pool    = nn.AdaptiveAvgPool1d(bottleneck_len)
         self.dropout = nn.Dropout(dropout)
         self.fc      = nn.Linear(c3 * bottleneck_len, latent_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.convs(x)             # (B, _BASE_CHANNELS, ~n/4)
-        x = self.pool(x)              # (B, _BASE_CHANNELS, _BOTTLENECK_LEN)
-        x = x.flatten(start_dim=1)    # (B, _BASE_CHANNELS * _BOTTLENECK_LEN)
+        x = self.convs(x)             # (B, c3, ~n)  (full temporal resolution preserved)
+        x = self.pool(x)              # (B, c3, bottleneck_len)
+        x = x.flatten(start_dim=1)    # (B, c3 * bottleneck_len)
         x = self.dropout(x)
         return self.fc(x)             # (B, latent_dim)
 
 
 class WingbeatDecoder(nn.Module):
     """
-    Decoder with a learnable upsampler: two Upsample(scale_factor=2, mode='nearest') +
-    Conv1d blocks (4× temporal expansion), then a final F.interpolate(linear) to handle
-    the fractional remainder up to `target_len`, then the channel-reduction conv stack.
+    Learnable-upsampler decoder. Structure:
+      fc → view → two Upsample(2×) + Conv1d blocks (4× learnable upsample) → F.interpolate
+      to handle the fractional remainder → learnable refiner (Conv1d+GN+act) → channel-reduction
+      conv stack.
 
-    The nearest+conv pattern avoids the checkerboard artifacts of ConvTranspose1d while
-    keeping the upsampling step learnable — letting the decoder render sharper transitions
-    than piecewise-linear interpolation alone could produce.
+    The nearest+conv upsampler avoids ConvTranspose1d checkerboard artifacts while keeping
+    upsampling learnable. The refiner after F.interpolate gives the model a chance to sharpen
+    what linear interpolation smoothed before the channel reduction kicks in.
     """
     def __init__(
         self,
@@ -159,12 +167,24 @@ class WingbeatDecoder(nn.Module):
 
         # Two learnable upsample stages. Stays at c3 channels so the downstream conv stack
         # is unchanged. Each stage doubles the temporal dim → 4× total.
+        # No GroupNorm in the upsampler — empirically regresses val loss ~3% (likely
+        # because the model is near its capacity ceiling and the extra activation constraint
+        # costs more than it stabilizes).
         self.upsampler = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv1d(c3, c3, kernel_size=3, padding=1, padding_mode='replicate'),
             _make_activation(activation),
             nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv1d(c3, c3, kernel_size=3, padding=1, padding_mode='replicate'),
+            _make_activation(activation),
+        )
+
+        # Learnable refinement applied immediately after the F.interpolate(linear).
+        # Gives the model a chance to sharpen / correct linearly-smoothed transitions
+        # before the channel-reduction conv stack.
+        self.refiner = nn.Sequential(
+            nn.Conv1d(c3, c3, kernel_size=kw, padding=pad, padding_mode='replicate'),
+            nn.GroupNorm(_NORM_GROUPS, c3),
             _make_activation(activation),
         )
 
@@ -186,6 +206,7 @@ class WingbeatDecoder(nn.Module):
         if x.size(-1) != target_len:
             # Final fractional step (4L → target_len); typically <1.5× for wingbeats.
             x = F.interpolate(x, size=target_len, mode='linear', align_corners=False)
+        x = self.refiner(x)                                                               # (B, C, n)
         return self.convs(x)                                                              # (B, 6, n)
 
 
@@ -205,7 +226,8 @@ class WingbeatAutoencoder(nn.Module):
             latent_dim, in_channels, activation, dropout, base_channels, bottleneck_len,
         )
         self.decoder = WingbeatDecoder(
-            latent_dim, in_channels, activation, dropout, base_channels, bottleneck_len, decoder_kernel_size,
+            latent_dim, in_channels, activation, dropout, base_channels, bottleneck_len,
+            decoder_kernel_size,
         )
         self.latent_dim          = latent_dim
         self.activation          = activation
@@ -359,14 +381,21 @@ def train_autoencoder(
     endpoint_weight: float = 1.0,
     endpoint_samples: int = 3,
     derivative_weight: float = 0.0,
-) -> tuple[list[float], list[float], dict]:
+    restart_check_epoch: int | None = None,
+    restart_threshold: float | None = None,
+) -> tuple[list[float], list[float], dict, bool]:
     """
     Trains the autoencoder.
+
+    If both `restart_check_epoch` and `restart_threshold` are set, training aborts
+    early once epoch `restart_check_epoch` completes if the best val loss so far is
+    above `restart_threshold`. The caller can then decide to re-init and retry.
 
     Returns:
         train_losses: per-epoch average training loss
         val_losses:   per-epoch average validation loss (empty list if no val_dataset)
         best_state:   state_dict of the epoch with the lowest monitored loss
+        was_stuck:    True if training was aborted early by the plateau detector
     """
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=_collate_fn)
     val_loader = (
@@ -447,10 +476,28 @@ def train_autoencoder(
             msg += f"  val={avg_val:.6f}"
         print(msg, flush=True)
 
+        # Early-stuck detection: if at the configured check-point the best val loss
+        # so far is above the threshold, this run is plateaued at a bad minimum.
+        # Abort early so the caller can re-init and retry.
+        if (
+            restart_check_epoch is not None
+            and restart_threshold is not None
+            and (epoch + 1) == restart_check_epoch
+            and best_monitor > restart_threshold
+        ):
+            print(
+                f"STUCK detected at epoch {epoch + 1}: best val loss {best_monitor:.6f} "
+                f"> threshold {restart_threshold:.6f}. Aborting for restart.",
+                flush=True,
+            )
+            if loss_fig_path:
+                _save_loss_figure(train_losses, val_losses, loss_fig_path)
+            return train_losses, val_losses, best_state, True
+
     if loss_fig_path:
         _save_loss_figure(train_losses, val_losses, loss_fig_path)
 
-    return train_losses, val_losses, best_state
+    return train_losses, val_losses, best_state, False
 
 def _save_loss_figure(train_losses: list[float], val_losses: list[float], path: str) -> None:
     epochs = range(1, len(train_losses) + 1)
@@ -752,45 +799,90 @@ def main():
     best_decoder_state   = None
     best_autoencoder_state = None
 
+    def _build_model(rcfg: dict) -> WingbeatAutoencoder:
+        return WingbeatAutoencoder(
+            latent_dim=rcfg['latent_dim'],
+            activation=rcfg.get('activation', 'gelu'),
+            dropout=rcfg.get('dropout', 0.0),
+            base_channels=rcfg.get('base_channels', _BASE_CHANNELS),
+            bottleneck_len=rcfg.get('bottleneck_len', _BOTTLENECK_LEN),
+            decoder_kernel_size=rcfg.get('decoder_kernel_size', 5),
+        )
+
     for run_idx, combo in enumerate(combos):
         run_config = {**fixed, **dict(zip(grid_keys, combo))}
         print(f"\n--- Run {run_idx + 1}/{n_runs} | {dict(zip(grid_keys, combo))} ---", flush=True)
 
-        model = WingbeatAutoencoder(
-            latent_dim=run_config['latent_dim'],
-            activation=run_config.get('activation', 'gelu'),
-            dropout=run_config.get('dropout', 0.0),
-            base_channels=run_config.get('base_channels', _BASE_CHANNELS),
-            bottleneck_len=run_config.get('bottleneck_len', _BOTTLENECK_LEN),
-            decoder_kernel_size=run_config.get('decoder_kernel_size', 5),
-        )
+        # Restart-on-plateau settings: when enabled, training aborts early at
+        # `restart_check_epoch` if the best val loss is still above `restart_threshold`,
+        # and we retry with a fresh init (different sub-seed). Disabled by default.
+        restart_on_plateau   = bool(run_config.get('restart_on_plateau', False))
+        restart_check_epoch  = run_config.get('restart_check_epoch', 25) if restart_on_plateau else None
+        restart_threshold    = run_config.get('restart_threshold', 0.0015) if restart_on_plateau else None
+        restart_max_attempts = int(run_config.get('restart_max_attempts', 3)) if restart_on_plateau else 0
 
+        run_seed = int(run_config.get('random_seed', seed))
         run_label = "_".join(f"{k}{v}" for k, v in zip(grid_keys, combo)) if grid_keys else "single"
-        loss_fig_path = os.path.join(analysis_dir, f"losses_run{run_idx + 1}_{run_label}.png")
 
-        train_losses, val_losses, best_state = train_autoencoder(
-            model               = model,
-            train_dataset       = train_dataset,
-            val_dataset         = val_dataset,
-            n_epochs            = run_config.get('n_epochs', 100),
-            lr                  = run_config.get('lr', 1e-3),
-            batch_size          = run_config.get('batch_size', 32),
-            device              = device,
-            loss_fig_path       = loss_fig_path,
-            optimizer_name      = run_config.get('optimizer', 'adam'),
-            weight_decay        = run_config.get('weight_decay', 0.0),
-            channel_loss_weight = run_config.get('channel_loss_weight'),
-            cycle_weight        = run_config.get('cycle_weight', 0.0),
-            endpoint_weight     = run_config.get('endpoint_weight', 1.0),
-            endpoint_samples    = run_config.get('endpoint_samples', 3),
-            derivative_weight   = run_config.get('derivative_weight', 0.0),
-        )
+        attempt = 0
+        train_losses = val_losses = []
+        best_state   = None
+        was_stuck    = False
+        while True:
+            # Re-seed before each attempt so initial inits are deterministic per (seed, attempt).
+            sub_seed = run_seed if attempt == 0 else run_seed * 1000 + attempt
+            torch.manual_seed(sub_seed)
+            np.random.seed(sub_seed)
+
+            if attempt > 0:
+                print(f"  Restart attempt {attempt}/{restart_max_attempts} (sub_seed={sub_seed})", flush=True)
+
+            model = _build_model(run_config)
+
+            loss_fig_path = os.path.join(
+                analysis_dir,
+                f"losses_run{run_idx + 1}_{run_label}"
+                + (f"_attempt{attempt}" if attempt > 0 else "")
+                + ".png",
+            )
+
+            train_losses, val_losses, best_state, was_stuck = train_autoencoder(
+                model               = model,
+                train_dataset       = train_dataset,
+                val_dataset         = val_dataset,
+                n_epochs            = run_config.get('n_epochs', 100),
+                lr                  = run_config.get('lr', 1e-3),
+                batch_size          = run_config.get('batch_size', 32),
+                device              = device,
+                loss_fig_path       = loss_fig_path,
+                optimizer_name      = run_config.get('optimizer', 'adam'),
+                weight_decay        = run_config.get('weight_decay', 0.0),
+                channel_loss_weight = run_config.get('channel_loss_weight'),
+                cycle_weight        = run_config.get('cycle_weight', 0.0),
+                endpoint_weight     = run_config.get('endpoint_weight', 1.0),
+                endpoint_samples    = run_config.get('endpoint_samples', 3),
+                derivative_weight   = run_config.get('derivative_weight', 0.0),
+                restart_check_epoch = restart_check_epoch,
+                restart_threshold   = restart_threshold,
+            )
+
+            if not was_stuck or attempt >= restart_max_attempts:
+                break
+            attempt += 1
+
+        attempts_used  = attempt + 1
+        final_was_stuck = was_stuck  # True only if all attempts were exhausted while stuck
 
         model.load_state_dict(best_state)
         run_best = min(val_losses) if val_losses else min(train_losses)
-        print(f"  Best val loss: {run_best:.6f}")
+        print(f"  Best val loss: {run_best:.6f}  (attempts={attempts_used}, final_stuck={final_was_stuck})")
 
-        summary.append({**dict(zip(grid_keys, combo)), 'best_val_loss': run_best})
+        summary.append({
+            **dict(zip(grid_keys, combo)),
+            'best_val_loss':   run_best,
+            'attempts':        attempts_used,
+            'final_was_stuck': final_was_stuck,
+        })
 
         if run_best < best_val_loss:
             best_val_loss          = run_best
