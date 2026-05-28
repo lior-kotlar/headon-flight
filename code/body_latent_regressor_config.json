@@ -1,0 +1,17 @@
+{
+    "dataset_path": "data/wingbeat_regressor_dataset.npz",
+    "autoencoder_model_dir": "data/models/autoencoder/enc_dil_dec_dil_lrnfinal_20260522_143829",
+    "save_dir": "data/models/body_latent_regressor",
+    "device": "auto",
+    "random_seed": [42, 123, 456],
+    "n_epochs": 70,
+    "batch_size": [32,64],
+    "lr": 1e-3,
+    "weight_decay": [1e-2, 1e-3],
+    "optimizer": "adamw",
+    "hidden_dims": [128, 128],
+    "activation": "gelu",
+    "dropout": 0.1,
+    "duration_loss_weight": 1.0,
+    "lr_scheduler": "plateau"
+}
