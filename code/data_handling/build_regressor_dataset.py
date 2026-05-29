@@ -39,6 +39,7 @@ from autoencoder import WingbeatAutoencoder
 from transform_data import (
     _wingbeat_peaks,
     _segment_to_sa,
+    _cubic_resample,
     SA_PHYSICAL_SCALE,
     trajectory_asymmetry_score,
 )
@@ -77,12 +78,14 @@ def _load_autoencoder(model_dir: str, device: str) -> WingbeatAutoencoder:
         base_channels       = ckpt.get("base_channels", 128),
         bottleneck_len      = ckpt.get("bottleneck_len", 12),
         decoder_kernel_size = ckpt.get("decoder_kernel_size", 5),
+        output_len          = ckpt["output_len"],
     )
     model.load_state_dict(ckpt["state_dict"])
     model.to(device).eval()
     print(
         f"Autoencoder loaded: latent_dim={model.latent_dim}  "
         f"base_channels={model.base_channels}  bottleneck_len={model.bottleneck_len}  "
+        f"output_len={model.output_len}  "
         f"val_loss={ckpt.get('val_loss', 'unknown')}"
     )
     return model
@@ -173,6 +176,8 @@ def main() -> None:
     print(f"{n_traj} trajectories after filtering — processing wingbeats...")
 
     sa_scale = torch.from_numpy(SA_PHYSICAL_SCALE).view(6, 1).to(device)
+    L = int(model.output_len)
+    print(f"Resampling each wingbeat to L={L} samples (CubicSpline) before encoding.")
 
     body_means_list:      list[np.ndarray] = []
     next_body_means_list: list[np.ndarray] = []
@@ -211,10 +216,11 @@ def main() -> None:
                 body_mean      = body_segment.mean(axis=0).astype(np.float32)     # (12,)
                 next_body_mean = next_body_segment.mean(axis=0).astype(np.float32)  # (12,)
 
-                # Build the same input the encoder was trained on: S/A representation
-                # transposed to (6, n) and divided by SA_PHYSICAL_SCALE.
+                # Build the same input the encoder was trained on: SA at native length,
+                # CubicSpline-resampled to L, transposed to (6, L), divided by SA_PHYSICAL_SCALE.
                 sa = _segment_to_sa(wing_segment, template)                       # (n, 6)
-                sa_t = torch.as_tensor(sa.T, device=device).unsqueeze(0) / sa_scale  # (1, 6, n)
+                sa_L = _cubic_resample(sa, L)                                      # (L, 6)
+                sa_t = torch.as_tensor(sa_L.T, device=device).unsqueeze(0) / sa_scale  # (1, 6, L)
 
                 latent = model.encoder(sa_t).squeeze(0).cpu().numpy().astype(np.float32)
 
@@ -258,6 +264,7 @@ def main() -> None:
         "n_dropped_last":        int(n_dropped_last),
         "n_skipped":             int(n_skipped),
         "latent_dim":            int(latent_dim),
+        "autoencoder_output_len": int(L),
         "has_next_body_mean":    True,
         "duration_min":          int(durations.min()),
         "duration_max":          int(durations.max()),

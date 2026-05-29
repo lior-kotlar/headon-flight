@@ -1,11 +1,73 @@
+"""
+transform_data.py — wingbeat extraction and fixed-length dataset builder.
+
+This module has two responsibilities:
+
+  1. Extract per-wingbeat segments from raw flight trajectories and build the
+     S/A "golden template" used to convert each wingbeat to its
+     (symmetric, asymmetric) residual representation.
+  2. Optionally produce a fixed-length wingbeat dataset (wingbeats_L<L>.npz)
+     where every wingbeat is CubicSpline-resampled to a constant length L.
+     This is consumed by the fixed-L autoencoder so the network learns
+     wingbeat *shape* without having to also learn duration.
+
+------------------------------------------------------------------------------
+CLI usage (run from the project root)
+------------------------------------------------------------------------------
+
+# Build only the variable-length artifacts (trajectories.npy + golden_template.npy):
+python code/transform_data.py
+
+# Additionally build a fixed-length wingbeat dataset at L=80 samples:
+python code/transform_data.py --fixed_len 80
+
+# The fixed-L build emits two files next to trajectories.npy:
+#   data/wingbeats_L80.npz   — arrays: sa_wingbeats (N, 6, L), durations (N,),
+#                              trajectory_ids (N,)
+#   data/wingbeats_L80.json  — sidecar metadata: schema_version, L,
+#                              interpolation method, build timestamp, and
+#                              md5 hashes of trajectories.npy + template
+#                              (used for drift detection on next load)
+
+------------------------------------------------------------------------------
+Programmatic usage (e.g. from autoencoder.py auto-build hook)
+------------------------------------------------------------------------------
+
+from transform_data import (
+    fixed_len_dataset_path,            # -> "data/wingbeats_L80.npz"
+    fixed_len_dataset_is_valid,        # -> (bool, reason)
+    build_fixed_len_dataset_from_disk, # rebuilds the npz + sidecar
+    _cubic_resample,                   # (arr (n, C), L) -> (L, C) via CubicSpline
+)
+
+ok, reason = fixed_len_dataset_is_valid(data_dir="data", L=80)
+if not ok:
+    build_fixed_len_dataset_from_disk(L=80, data_dir="data")
+
+------------------------------------------------------------------------------
+Notes
+------------------------------------------------------------------------------
+- Interpolation is always CubicSpline (scipy.interpolate.CubicSpline). The
+  sidecar records this as _FIXED_LEN_INTERP_METHOD so a future switch in
+  method invalidates old caches.
+- The sidecar's md5 hashes of trajectories.npy and the template file are how
+  fixed_len_dataset_is_valid() detects stale caches without re-reading the
+  full arrays.
+- Channel order in sa_wingbeats is (S_phi, S_theta, S_psi, A_phi, A_theta,
+  A_psi), normalized by SA_PHYSICAL_SCALE. Stored channels-first as (N, 6, L)
+  to match the autoencoder's Conv1d expectations.
+"""
+
 import argparse
+import hashlib
 import json
 import os
 import sys
+from datetime import datetime
 
 import numpy as np
 from scipy.signal import find_peaks
-from scipy.interpolate import interp1d
+from scipy.interpolate import interp1d, CubicSpline
 import matplotlib.pyplot as plt
 from loguru import logger
 
@@ -285,6 +347,205 @@ def _load_wing_trajectories(processed_dir: str, use_radians: bool = True) -> lis
     return trajectories
 
 
+# ---------------------------------------------------------------------------
+# Fixed-length wingbeat dataset (for the new architecture where the autoencoder
+# always sees length L).
+# ---------------------------------------------------------------------------
+
+
+_FIXED_LEN_INTERP_METHOD = "cubic_spline"   # what we use to resample SA wingbeats to L
+_FIXED_LEN_SCHEMA_VERSION = 1                # bump when on-disk schema changes
+
+
+def _file_md5(path: str) -> str:
+    """Stable file fingerprint for sidecar drift detection. Empty string if missing."""
+    if not path or not os.path.exists(path):
+        return ""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _cubic_resample(arr: np.ndarray, L: int) -> np.ndarray:
+    """Resample a (n, C) signal to (L, C) along axis 0 via CubicSpline."""
+    n = arr.shape[0]
+    if n == L:
+        return arr.astype(np.float32, copy=False)
+    x_old = np.linspace(0.0, 1.0, n)
+    x_new = np.linspace(0.0, 1.0, L)
+    cs    = CubicSpline(x_old, arr, axis=0)
+    return cs(x_new).astype(np.float32)
+
+
+def fixed_len_dataset_path(data_dir: str, L: int) -> str:
+    return os.path.join(data_dir, f"wingbeats_L{L}.npz")
+
+
+def fixed_len_sidecar_path(data_dir: str, L: int) -> str:
+    return os.path.join(data_dir, f"wingbeats_L{L}.json")
+
+
+def build_fixed_len_dataset(
+    L: int,
+    trajectories: list,
+    template: np.ndarray,
+    output_path: str,
+    *,
+    trajectories_path: str = "",
+    template_path: str = "",
+    use_radians: bool = True,
+    asymmetry_max_multiple: float | None = None,
+) -> dict:
+    """
+    Build the fixed-length wingbeat dataset and its sidecar JSON.
+
+    Each wingbeat (between consecutive peaks) is SA-transformed against the
+    golden template at native length, normalized by SA_PHYSICAL_SCALE, and then
+    CubicSpline-resampled along the time axis to length L. The result is stored
+    channels-first so it can be fed straight into the encoder as (B, 6, L).
+
+    Atomic write: a .tmp file is created and renamed in place to avoid leaving
+    a half-written .npz on disk if the process is killed.
+
+    Returns the sidecar metadata dict (also written to disk alongside .npz).
+    """
+    sa_wingbeats:   list[np.ndarray] = []
+    durations:      list[int]        = []
+    trajectory_ids: list[int]        = []
+    n_skipped = 0
+
+    for traj_id, traj in enumerate(trajectories):
+        peaks = _wingbeat_peaks(traj)
+        for i in range(len(peaks) - 1):
+            start, end = int(peaks[i]), int(peaks[i + 1])
+            n = end - start
+            if n <= 1:
+                n_skipped += 1
+                continue
+            sa_native = _segment_to_sa(traj[start:end], template)       # (n, 6)
+            sa_L      = _cubic_resample(sa_native, L)                   # (L, 6)
+            sa_L_norm = sa_L / SA_PHYSICAL_SCALE                        # broadcast (6,) → (L, 6)
+            sa_wingbeats.append(sa_L_norm.T.astype(np.float32))         # (6, L)
+            durations.append(n)
+            trajectory_ids.append(traj_id)
+
+    if not sa_wingbeats:
+        raise RuntimeError("No wingbeats produced — check trajectories input.")
+
+    sa_arr  = np.stack(sa_wingbeats)                                    # (N, 6, L)
+    dur_arr = np.asarray(durations,      dtype=np.int32)
+    tid_arr = np.asarray(trajectory_ids, dtype=np.int32)
+
+    # --- Sidecar metadata (for drift detection in consumers) ---
+    sidecar = {
+        "schema_version":         _FIXED_LEN_SCHEMA_VERSION,
+        "L":                      int(L),
+        "interpolation":          _FIXED_LEN_INTERP_METHOD,
+        "sa_physical_scale":      SA_PHYSICAL_SCALE.tolist(),
+        "use_radians":            bool(use_radians),
+        "asymmetry_max_multiple": asymmetry_max_multiple,
+        "n_wingbeats":            int(sa_arr.shape[0]),
+        "n_trajectories":         int(len(trajectories)),
+        "duration_min":           int(dur_arr.min()),
+        "duration_max":           int(dur_arr.max()),
+        "duration_mean":          float(dur_arr.mean()),
+        "duration_std":           float(dur_arr.std()),
+        "n_skipped":              int(n_skipped),
+        "trajectories_path":      trajectories_path,
+        "trajectories_md5":       _file_md5(trajectories_path),
+        "template_path":          template_path,
+        "template_md5":           _file_md5(template_path),
+        "built_at":               datetime.now().isoformat(timespec="seconds"),
+    }
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    # Atomic write: temp file in the same directory, then rename.
+    # np.savez auto-appends .npz if the path doesn't already end in it, so the temp
+    # path needs to end in .npz too — otherwise the file we write and the file we
+    # try to rename are different paths.
+    tmp_path = output_path[:-len(".npz")] + ".tmp.npz" if output_path.endswith(".npz") else output_path + ".tmp.npz"
+    np.savez(
+        tmp_path,
+        sa_wingbeats   = sa_arr,
+        durations      = dur_arr,
+        trajectory_ids = tid_arr,
+    )
+    os.replace(tmp_path, output_path)
+
+    sidecar_path = os.path.splitext(output_path)[0] + ".json"
+    tmp_sidecar  = sidecar_path + ".tmp"
+    with open(tmp_sidecar, "w") as f:
+        json.dump(sidecar, f, indent=2)
+    os.replace(tmp_sidecar, sidecar_path)
+
+    logger.info(
+        f"Fixed-length dataset (L={L}): {sa_arr.shape[0]} wingbeats from "
+        f"{len(trajectories)} trajectories → {output_path}"
+    )
+    if n_skipped:
+        logger.warning(f"  Skipped {n_skipped} wingbeats with non-positive duration.")
+    return sidecar
+
+
+def build_fixed_len_dataset_from_disk(
+    L: int,
+    trajectories_path: str,
+    template_path: str,
+    output_path: str,
+    *,
+    use_radians: bool = True,
+    asymmetry_max_multiple: float | None = None,
+) -> dict:
+    """Convenience wrapper that loads trajectories + template from disk and builds."""
+    trajectories = np.load(trajectories_path, allow_pickle=True).tolist()
+    template     = np.load(template_path)
+    return build_fixed_len_dataset(
+        L                      = L,
+        trajectories           = trajectories,
+        template               = template,
+        output_path            = output_path,
+        trajectories_path      = trajectories_path,
+        template_path          = template_path,
+        use_radians            = use_radians,
+        asymmetry_max_multiple = asymmetry_max_multiple,
+    )
+
+
+def fixed_len_dataset_is_valid(
+    output_path: str,
+    sidecar_path: str,
+    *,
+    L: int,
+    trajectories_path: str,
+    template_path: str,
+) -> tuple[bool, str]:
+    """
+    Returns (is_valid, reason). is_valid=True means the on-disk dataset can be loaded
+    as-is; False means it's missing or stale and the caller should rebuild.
+    """
+    if not os.path.exists(output_path):
+        return False, f"missing dataset {output_path}"
+    if not os.path.exists(sidecar_path):
+        return False, f"missing sidecar {sidecar_path}"
+    try:
+        with open(sidecar_path) as f:
+            meta = json.load(f)
+    except json.JSONDecodeError as e:
+        return False, f"corrupt sidecar: {e}"
+    if meta.get("schema_version") != _FIXED_LEN_SCHEMA_VERSION:
+        return False, f"schema_version mismatch ({meta.get('schema_version')} ≠ {_FIXED_LEN_SCHEMA_VERSION})"
+    if int(meta.get("L", -1)) != int(L):
+        return False, f"L mismatch ({meta.get('L')} ≠ {L})"
+    if meta.get("template_md5") != _file_md5(template_path):
+        return False, "template file changed since build"
+    if meta.get("trajectories_md5") != _file_md5(trajectories_path):
+        return False, "trajectories file changed since build"
+    return True, "ok"
+
+
 def main() -> None:
     """
     Loads wing trajectories from processed H5 files, generates the golden wingbeat
@@ -321,6 +582,14 @@ def main() -> None:
         default=10.0,
         help="Drop trajectories whose L/R asymmetry score exceeds this multiple of the "
              "dataset median. Set to 0 to disable garbage filtering. Default: 10.0.",
+    )
+    parser.add_argument(
+        "--fixed_len",
+        type=int,
+        default=0,
+        help="If > 0, additionally build wingbeats_L<fixed_len>.npz — every wingbeat's "
+             "SA representation CubicSpline-resampled to this many samples. The variable-length "
+             "trajectories.npy and template are still produced. Default: 0 (no fixed-length file).",
     )
     args = parser.parse_args()
 
@@ -386,6 +655,23 @@ def main() -> None:
     # --- Verify round-trip correctness ---
     verify_path = os.path.join(os.path.dirname(template_path), "sa_transform_verification.png")
     verify_sa_transform(trajectories, template, save_path=verify_path)
+
+    # --- Optionally build the fixed-length wingbeat dataset for the new AE architecture ---
+    if args.fixed_len and args.fixed_len > 0:
+        L = int(args.fixed_len)
+        data_dir = os.path.dirname(os.path.abspath(data_path))
+        out_path = fixed_len_dataset_path(data_dir, L)
+        logger.info(f"Building fixed-length dataset (L={L}) → {out_path}")
+        build_fixed_len_dataset(
+            L                      = L,
+            trajectories           = trajectories,
+            template               = template,
+            output_path            = out_path,
+            trajectories_path      = data_path,
+            template_path          = template_path,
+            use_radians            = not args.no_radians,
+            asymmetry_max_multiple = args.asymmetry_max_multiple,
+        )
 
 
 if __name__ == '__main__':

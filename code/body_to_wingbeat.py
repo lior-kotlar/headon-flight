@@ -26,6 +26,7 @@ import torch.nn as nn
 
 from autoencoder import WingbeatAutoencoder
 from body_latent_regressor import BodyLatentRegressor, _load_split
+from transform_data import _cubic_resample
 
 
 class BodyToWingbeat(nn.Module):
@@ -82,17 +83,20 @@ class BodyToWingbeat(nn.Module):
         body_mean: torch.Tensor,
         next_body_mean: torch.Tensor,
     ) -> list[torch.Tensor]:
-        """Decode each row to its own length.
+        """Decode at fixed L, then CubicSpline-resample each row to its predicted duration.
 
-        Returns a list of (T_i, 6) S/A tensors. Lengths vary, so we cannot stack;
-        the caller stitches if needed.
+        Returns a list of (T_i, 6) S/A tensors (CPU). Lengths vary by row, so we cannot stack.
+        The decoder always produces L samples; CubicSpline interpolation happens here in
+        numpy because torch's `F.interpolate` has no 1D cubic mode.
         """
         latent, dur = self.predict_latent_and_duration(body_mean, next_body_mean)
+        wing_L = self.decoder(latent)                                # (B, 6, L), L = self.decoder.output_len
+        wing_L_np = wing_L.transpose(1, 2).detach().cpu().numpy()    # (B, L, 6) for the resampler
         outputs = []
-        for i in range(latent.size(0)):
+        for i in range(wing_L_np.shape[0]):
             T_i = int(dur[i].item())
-            wing_i = self.decoder(latent[i:i + 1], target_len=T_i)   # (1, 6, T_i)
-            outputs.append(wing_i.squeeze(0).transpose(0, 1))         # (T_i, 6)
+            wing_i = _cubic_resample(wing_L_np[i], T_i)        # (T_i, 6)
+            outputs.append(torch.from_numpy(wing_i))
         return outputs
 
 
@@ -121,6 +125,7 @@ def load_body_to_wingbeat(
         base_channels       = a_ckpt.get("base_channels", 128),
         bottleneck_len      = a_ckpt.get("bottleneck_len", 12),
         decoder_kernel_size = a_ckpt.get("decoder_kernel_size", 5),
+        output_len          = a_ckpt["output_len"],
     )
     ae.load_state_dict(a_ckpt["state_dict"])
     ae.to(device).eval()
