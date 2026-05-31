@@ -15,19 +15,30 @@ This module has two responsibilities:
 CLI usage (run from the project root)
 ------------------------------------------------------------------------------
 
-# Build only the variable-length artifacts (trajectories.npy + golden_template.npy):
+# Build the variable-length artifacts (trajectories.npy + body_kinematics.npy
+# + golden_template.npy):
 python code/transform_data.py
 
-# Additionally build a fixed-length wingbeat dataset at L=80 samples:
+# Additionally build a fixed-length wingbeat dataset at L=80 samples
+# (also computes per-wingbeat body_means and maneuver_scores):
 python code/transform_data.py --fixed_len 80
 
-# The fixed-L build emits two files next to trajectories.npy:
-#   data/wingbeats_L80.npz   — arrays: sa_wingbeats (N, 6, L), durations (N,),
+# Always-emitted files (next to trajectories.npy):
+#   data/trajectories.npy     — object array of (T_i, 6) wing-angle arrays per flight
+#   data/body_kinematics.npy  — object array of (T_i, 12) body-kinematic arrays per
+#                               flight, columns [v(3), a(3), ω(3), α(3)]. Same indexing
+#                               as trajectories.npy — the asymmetry filter prunes both
+#                               in lockstep.
+#
+# Fixed-L build adds:
+#   data/wingbeats_L80.npz   — arrays: sa_wingbeats (N, 6, L), body_means (N, 12),
+#                              maneuver_scores (N, 6), durations (N,),
 #                              trajectory_ids (N,)
-#   data/wingbeats_L80.json  — sidecar metadata: schema_version, L,
-#                              interpolation method, build timestamp, and
-#                              md5 hashes of trajectories.npy + template
-#                              (used for drift detection on next load)
+#   data/wingbeats_L80.json  — sidecar: schema_version, L, interpolation method,
+#                              build timestamp, md5 hashes of trajectories.npy +
+#                              body_kinematics.npy + template, plus maneuver-scoring
+#                              params (W, T_coh, T_mag_percentile, per-channel T_mag).
+#                              Drift detection rebuilds the npz if any of those change.
 
 ------------------------------------------------------------------------------
 Programmatic usage (e.g. from autoencoder.py auto-build hook)
@@ -241,40 +252,45 @@ def generate_average_wingbeat_template(trajectories, template_res=100, plot_temp
             
             all_cycles.append(normalized_cycle)
 
-    # Calculate the 'Golden' Mean
-    # Resulting shape: (100, 6)
-    template = np.mean(all_cycles, axis=0).astype(np.float32)
-    
+    # Calculate the 'Golden' Mean and the per-phase, per-channel std across all cycles.
+    # all_cycles_arr shape: (n_cycles, template_res, 6).
+    all_cycles_arr = np.stack(all_cycles, axis=0)
+    template = all_cycles_arr.mean(axis=0).astype(np.float32)
+    template_std = all_cycles_arr.std(axis=0).astype(np.float32)  # (template_res, 6)
+
     # ---------------------------------------------------------
     # Plotting and Saving Logic
     # Assumes column order: [L_Stroke, L_Dev, L_Rot, R_Stroke, R_Dev, R_Rot]
+    # A ±1 std band is shaded around each mean curve to show inter-cycle spread.
     # ---------------------------------------------------------
     if plot_template:
         phase = np.linspace(0, 1, template_res)
         fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
-        fig.suptitle("Normalized 'Golden' Hover Template", fontsize=16)
+        fig.suptitle(f"Normalized 'Golden' Hover Template (n_cycles={len(all_cycles)}, shaded = ±1 std)", fontsize=14)
 
-        # 1. Stroke Angle (phi)
-        axes[0].plot(phase, template[:, 0], label='Left Stroke', color='blue', linewidth=2)
-        axes[0].plot(phase, template[:, 3], label='Right Stroke', color='red', linestyle='--', linewidth=2)
-        axes[0].set_ylabel('Stroke [rad]')
-        axes[0].legend(loc="upper right")
-        axes[0].grid(True, alpha=0.5)
+        def _plot_pair(ax, angle_idx_l: int, angle_idx_r: int, ylabel: str, l_label: str, r_label: str):
+            ax.plot(phase, template[:, angle_idx_l], label=l_label, color='blue', linewidth=2)
+            ax.fill_between(
+                phase,
+                template[:, angle_idx_l] - template_std[:, angle_idx_l],
+                template[:, angle_idx_l] + template_std[:, angle_idx_l],
+                color='blue', alpha=0.2, linewidth=0,
+            )
+            ax.plot(phase, template[:, angle_idx_r], label=r_label, color='red', linestyle='--', linewidth=2)
+            ax.fill_between(
+                phase,
+                template[:, angle_idx_r] - template_std[:, angle_idx_r],
+                template[:, angle_idx_r] + template_std[:, angle_idx_r],
+                color='red', alpha=0.2, linewidth=0,
+            )
+            ax.set_ylabel(ylabel)
+            ax.legend(loc="upper right")
+            ax.grid(True, alpha=0.5)
 
-        # 2. Deviation Angle (theta)
-        axes[1].plot(phase, template[:, 1], label='Left Deviation', color='blue', linewidth=2)
-        axes[1].plot(phase, template[:, 4], label='Right Deviation', color='red', linestyle='--', linewidth=2)
-        axes[1].set_ylabel('Deviation [rad]')
-        axes[1].legend(loc="upper right")
-        axes[1].grid(True, alpha=0.5)
-
-        # 3. Rotation Angle (psi)
-        axes[2].plot(phase, template[:, 2], label='Left Rotation', color='blue', linewidth=2)
-        axes[2].plot(phase, template[:, 5], label='Right Rotation', color='red', linestyle='--', linewidth=2)
-        axes[2].set_ylabel('Rotation [rad]')
+        _plot_pair(axes[0], 0, 3, 'Stroke [rad]',    'Left Stroke',    'Right Stroke')
+        _plot_pair(axes[1], 1, 4, 'Deviation [rad]', 'Left Deviation', 'Right Deviation')
+        _plot_pair(axes[2], 2, 5, 'Rotation [rad]',  'Left Rotation',  'Right Rotation')
         axes[2].set_xlabel('Normalized Phase [0.0 - 1.0]')
-        axes[2].legend(loc="upper right")
-        axes[2].grid(True, alpha=0.5)
 
         plt.tight_layout()
         
@@ -328,23 +344,32 @@ def transform_to_symmetric_asymmetric(trajectories, template, stroke_idx=0):
     return transformed_trajectories
 
 
-def _load_wing_trajectories(processed_dir: str, use_radians: bool = True) -> list[np.ndarray]:
-    """Returns one (N, 6) float32 wing-angle array per processed H5 file."""
+def _load_wing_and_body_trajectories(
+    processed_dir: str, use_radians: bool = True,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """
+    Returns (wing_trajectories, body_trajectories) — one (T, 6) wing-angle and
+    one (T, 12) body-kinematic array per processed H5 file, in the same order.
+
+    Body columns from _extract_features_and_targets are [v(3), a(3), ω(3), α(3)].
+    """
     files = sorted(f for f in os.listdir(processed_dir) if f.endswith('.h5'))
     if not files:
         raise FileNotFoundError(f"No .h5 files found in {processed_dir}")
 
-    trajectories = []
+    wing_trajectories: list[np.ndarray] = []
+    body_trajectories: list[np.ndarray] = []
     for fname in files:
-        _, wing_matrix = _extract_features_and_targets(
+        body_matrix, wing_matrix = _extract_features_and_targets(
             os.path.join(processed_dir, fname),
-            forces_indication_vector=None,  # None → skip body-column filtering
+            forces_indication_vector=None,  # None → keep all 12 body columns
             use_radians=use_radians,
         )
-        trajectories.append(wing_matrix)
-        logger.info(f"  {fname}: {wing_matrix.shape}")
+        wing_trajectories.append(wing_matrix)
+        body_trajectories.append(body_matrix.astype(np.float32))
+        logger.info(f"  {fname}: wing={wing_matrix.shape} body={body_matrix.shape}")
 
-    return trajectories
+    return wing_trajectories, body_trajectories
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +379,19 @@ def _load_wing_trajectories(processed_dir: str, use_radians: bool = True) -> lis
 
 
 _FIXED_LEN_INTERP_METHOD = "cubic_spline"   # what we use to resample SA wingbeats to L
-_FIXED_LEN_SCHEMA_VERSION = 1                # bump when on-disk schema changes
+_FIXED_LEN_SCHEMA_VERSION = 3                # bump when on-disk schema changes
+                                              # v2: added body_means + maneuver_scores arrays
+                                              #     and matching sidecar fields
+                                              # v3: maneuver_scores narrowed from 6 channels
+                                              #     to 3 (angular acceleration only; linear
+                                              #     acceleration excluded until gravity is
+                                              #     subtracted upstream)
+
+# Body kinematics column layout from _extract_features_and_targets:
+# [v(3), a(3), ω(3), α(3)]. _BODY_A_COLS is kept here as documentation; linear
+# acceleration is not currently fed into maneuver scoring.
+_BODY_A_COLS     = slice(3, 6)    # linear acceleration in body frame (unused, contains gravity)
+_BODY_ALPHA_COLS = slice(9, 12)   # angular acceleration in body frame
 
 
 def _file_md5(path: str) -> str:
@@ -387,16 +424,26 @@ def fixed_len_sidecar_path(data_dir: str, L: int) -> str:
     return os.path.join(data_dir, f"wingbeats_L{L}.json")
 
 
+def body_kinematics_path(data_dir: str) -> str:
+    """Per-trajectory body kinematics live alongside trajectories.npy. Same indexing."""
+    return os.path.join(data_dir, "body_kinematics.npy")
+
+
 def build_fixed_len_dataset(
     L: int,
     trajectories: list,
+    body_trajectories: list,
     template: np.ndarray,
     output_path: str,
     *,
     trajectories_path: str = "",
+    body_kinematics_path_str: str = "",
     template_path: str = "",
     use_radians: bool = True,
     asymmetry_max_multiple: float | None = None,
+    maneuver_W: int = 4,
+    maneuver_T_coh: float = 0.75,
+    maneuver_T_mag_percentile: float = 75.0,
 ) -> dict:
     """
     Build the fixed-length wingbeat dataset and its sidecar JSON.
@@ -406,17 +453,34 @@ def build_fixed_len_dataset(
     CubicSpline-resampled along the time axis to length L. The result is stored
     channels-first so it can be fed straight into the encoder as (B, 6, L).
 
+    The corresponding slice of each trajectory's body-kinematic matrix is
+    averaged per wingbeat to produce a (N, 12) body_means array. The angular-
+    and linear-acceleration sub-vectors of those means are then passed through
+    the windowed maneuver detector (data_handling/maneuver_scoring.py) to emit
+    a (N, 6) graded score per wingbeat — one channel per body axis. This score
+    is purely body-kinematic; wing angles never influence it.
+
     Atomic write: a .tmp file is created and renamed in place to avoid leaving
     a half-written .npz on disk if the process is killed.
 
     Returns the sidecar metadata dict (also written to disk alongside .npz).
     """
+    if len(body_trajectories) != len(trajectories):
+        raise ValueError(
+            f"body/wing trajectory count mismatch: {len(body_trajectories)} vs {len(trajectories)}"
+        )
+
     sa_wingbeats:   list[np.ndarray] = []
+    body_means:     list[np.ndarray] = []
     durations:      list[int]        = []
     trajectory_ids: list[int]        = []
     n_skipped = 0
 
-    for traj_id, traj in enumerate(trajectories):
+    for traj_id, (traj, body) in enumerate(zip(trajectories, body_trajectories)):
+        if body.shape[0] != traj.shape[0]:
+            raise ValueError(
+                f"trajectory {traj_id}: body length {body.shape[0]} ≠ wing length {traj.shape[0]}"
+            )
         peaks = _wingbeat_peaks(traj)
         for i in range(len(peaks) - 1):
             start, end = int(peaks[i]), int(peaks[i + 1])
@@ -428,15 +492,30 @@ def build_fixed_len_dataset(
             sa_L      = _cubic_resample(sa_native, L)                   # (L, 6)
             sa_L_norm = sa_L / SA_PHYSICAL_SCALE                        # broadcast (6,) → (L, 6)
             sa_wingbeats.append(sa_L_norm.T.astype(np.float32))         # (6, L)
+            # Per-wingbeat mean of the 12-d body-kinematic vector. Mean-of-vectors
+            # (not mean-of-magnitudes) — preserves direction so the across-wingbeat
+            # sign-consistency check in the maneuver detector is meaningful.
+            body_means.append(body[start:end].mean(axis=0).astype(np.float32))
             durations.append(n)
             trajectory_ids.append(traj_id)
 
     if not sa_wingbeats:
         raise RuntimeError("No wingbeats produced — check trajectories input.")
 
-    sa_arr  = np.stack(sa_wingbeats)                                    # (N, 6, L)
-    dur_arr = np.asarray(durations,      dtype=np.int32)
-    tid_arr = np.asarray(trajectory_ids, dtype=np.int32)
+    sa_arr   = np.stack(sa_wingbeats)                                    # (N, 6, L)
+    bm_arr   = np.stack(body_means)                                      # (N, 12)
+    dur_arr  = np.asarray(durations,      dtype=np.int32)
+    tid_arr  = np.asarray(trajectory_ids, dtype=np.int32)
+
+    # --- Maneuver scoring (angular acceleration only; see maneuver_scoring.py) ---
+    from data_handling.maneuver_scoring import compute_maneuver_scores  # local import; no cycle
+    maneuver_scores, maneuver_meta = compute_maneuver_scores(
+        mean_alpha       = bm_arr[:, _BODY_ALPHA_COLS],
+        trajectory_ids   = tid_arr,
+        W                = maneuver_W,
+        T_coh            = maneuver_T_coh,
+        T_mag_percentile = maneuver_T_mag_percentile,
+    )
 
     # --- Sidecar metadata (for drift detection in consumers) ---
     sidecar = {
@@ -455,9 +534,12 @@ def build_fixed_len_dataset(
         "n_skipped":              int(n_skipped),
         "trajectories_path":      trajectories_path,
         "trajectories_md5":       _file_md5(trajectories_path),
+        "body_kinematics_path":   body_kinematics_path_str,
+        "body_kinematics_md5":    _file_md5(body_kinematics_path_str),
         "template_path":          template_path,
         "template_md5":           _file_md5(template_path),
         "built_at":               datetime.now().isoformat(timespec="seconds"),
+        **maneuver_meta,
     }
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -469,9 +551,11 @@ def build_fixed_len_dataset(
     tmp_path = output_path[:-len(".npz")] + ".tmp.npz" if output_path.endswith(".npz") else output_path + ".tmp.npz"
     np.savez(
         tmp_path,
-        sa_wingbeats   = sa_arr,
-        durations      = dur_arr,
-        trajectory_ids = tid_arr,
+        sa_wingbeats    = sa_arr,
+        body_means      = bm_arr,
+        maneuver_scores = maneuver_scores,
+        durations       = dur_arr,
+        trajectory_ids  = tid_arr,
     )
     os.replace(tmp_path, output_path)
 
@@ -496,21 +580,48 @@ def build_fixed_len_dataset_from_disk(
     template_path: str,
     output_path: str,
     *,
+    body_kinematics_path_str: str | None = None,
     use_radians: bool = True,
     asymmetry_max_multiple: float | None = None,
+    maneuver_W: int = 4,
+    maneuver_T_coh: float = 0.75,
+    maneuver_T_mag_percentile: float = 75.0,
 ) -> dict:
-    """Convenience wrapper that loads trajectories + template from disk and builds."""
-    trajectories = np.load(trajectories_path, allow_pickle=True).tolist()
-    template     = np.load(template_path)
+    """
+    Convenience wrapper that loads trajectories + body kinematics + template
+    from disk and builds the fixed-length dataset.
+
+    If body_kinematics_path_str is None, the loader derives it from
+    trajectories_path by convention (body_kinematics.npy in the same directory).
+    """
+    if body_kinematics_path_str is None:
+        body_kinematics_path_str = body_kinematics_path(
+            os.path.dirname(os.path.abspath(trajectories_path))
+        )
+    if not os.path.exists(body_kinematics_path_str):
+        raise FileNotFoundError(
+            f"body kinematics file not found: {body_kinematics_path_str}\n"
+            f"This file is required for maneuver scoring in the fixed-length dataset. "
+            f"It is produced by transform_data.py alongside trajectories.npy. "
+            f"Run:  python code/transform_data.py --fixed_len {L}"
+        )
+    trajectories      = np.load(trajectories_path,        allow_pickle=True).tolist()
+    body_trajectories = np.load(body_kinematics_path_str, allow_pickle=True).tolist()
+    template          = np.load(template_path)
     return build_fixed_len_dataset(
-        L                      = L,
-        trajectories           = trajectories,
-        template               = template,
-        output_path            = output_path,
-        trajectories_path      = trajectories_path,
-        template_path          = template_path,
-        use_radians            = use_radians,
-        asymmetry_max_multiple = asymmetry_max_multiple,
+        L                          = L,
+        trajectories               = trajectories,
+        body_trajectories          = body_trajectories,
+        template                   = template,
+        output_path                = output_path,
+        trajectories_path          = trajectories_path,
+        body_kinematics_path_str   = body_kinematics_path_str,
+        template_path              = template_path,
+        use_radians                = use_radians,
+        asymmetry_max_multiple     = asymmetry_max_multiple,
+        maneuver_W                 = maneuver_W,
+        maneuver_T_coh             = maneuver_T_coh,
+        maneuver_T_mag_percentile  = maneuver_T_mag_percentile,
     )
 
 
@@ -521,10 +632,18 @@ def fixed_len_dataset_is_valid(
     L: int,
     trajectories_path: str,
     template_path: str,
+    body_kinematics_path_str: str | None = None,
+    maneuver_W: int | None = None,
+    maneuver_T_coh: float | None = None,
+    maneuver_T_mag_percentile: float | None = None,
 ) -> tuple[bool, str]:
     """
     Returns (is_valid, reason). is_valid=True means the on-disk dataset can be loaded
     as-is; False means it's missing or stale and the caller should rebuild.
+
+    Maneuver params (W / T_coh / T_mag_percentile) are checked against the sidecar
+    only when the caller passes a non-None value. This lets autoencoder configs
+    that don't care about maneuver scoring stay valid against any sidecar settings.
     """
     if not os.path.exists(output_path):
         return False, f"missing dataset {output_path}"
@@ -543,6 +662,23 @@ def fixed_len_dataset_is_valid(
         return False, "template file changed since build"
     if meta.get("trajectories_md5") != _file_md5(trajectories_path):
         return False, "trajectories file changed since build"
+
+    if body_kinematics_path_str is None:
+        body_kinematics_path_str = body_kinematics_path(
+            os.path.dirname(os.path.abspath(trajectories_path))
+        )
+    if not os.path.exists(body_kinematics_path_str):
+        return False, f"missing body kinematics file {body_kinematics_path_str}"
+    if meta.get("body_kinematics_md5") != _file_md5(body_kinematics_path_str):
+        return False, "body kinematics file changed since build"
+
+    if maneuver_W is not None and int(meta.get("maneuver_W", -1)) != int(maneuver_W):
+        return False, f"maneuver_W mismatch ({meta.get('maneuver_W')} ≠ {maneuver_W})"
+    if maneuver_T_coh is not None and float(meta.get("maneuver_T_coh", -1)) != float(maneuver_T_coh):
+        return False, f"maneuver_T_coh mismatch ({meta.get('maneuver_T_coh')} ≠ {maneuver_T_coh})"
+    if maneuver_T_mag_percentile is not None and float(meta.get("maneuver_T_mag_percentile", -1)) != float(maneuver_T_mag_percentile):
+        return False, f"maneuver_T_mag_percentile mismatch ({meta.get('maneuver_T_mag_percentile')} ≠ {maneuver_T_mag_percentile})"
+
     return True, "ok"
 
 
@@ -591,6 +727,18 @@ def main() -> None:
              "SA representation CubicSpline-resampled to this many samples. The variable-length "
              "trajectories.npy and template are still produced. Default: 0 (no fixed-length file).",
     )
+    parser.add_argument(
+        "--maneuver_W", type=int, default=4,
+        help="Sliding-window size (wingbeats) for maneuver detection inside the fixed-length build. Default: 4.",
+    )
+    parser.add_argument(
+        "--maneuver_T_coh", type=float, default=0.75,
+        help="Sign-consistency threshold for the maneuver detector, in [0, 1]. Default: 0.75.",
+    )
+    parser.add_argument(
+        "--maneuver_T_mag_percentile", type=float, default=75.0,
+        help="Per-channel magnitude threshold expressed as a percentile of |x^k| across the corpus. Default: 75.",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -606,14 +754,16 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(data_path)),     exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(template_path)), exist_ok=True)
 
-    # --- Load wing trajectories from processed H5 files ---
+    # --- Load wing + body trajectories from processed H5 files ---
     logger.info(f"Loading trajectories from {PROCESSED_TRAIN_FLIGHT_DATA_DIR} ...")
-    trajectories = _load_wing_trajectories(PROCESSED_TRAIN_FLIGHT_DATA_DIR, use_radians=not args.no_radians)
-    logger.info(f"Loaded {len(trajectories)} trajectories.")
+    trajectories, body_trajectories = _load_wing_and_body_trajectories(
+        PROCESSED_TRAIN_FLIGHT_DATA_DIR, use_radians=not args.no_radians
+    )
+    logger.info(f"Loaded {len(trajectories)} trajectories (wing + body).")
 
     # --- Drop garbage trajectories by L/R asymmetry score ---
-    # Anything with mean(|L-R|)/scale (max across angles) far above the dataset median
-    # is almost certainly a tracking failure — remove before downstream consumers see it.
+    # Asymmetry is a wing-angle property, but the resulting keep_mask is applied to both
+    # the wing and body arrays so their indexing stays in lockstep through everything downstream.
     if args.asymmetry_max_multiple > 0 and len(trajectories) > 0:
         scores = np.array([trajectory_asymmetry_score(t) for t in trajectories], dtype=np.float64)
         median_score = float(np.median(scores))
@@ -629,16 +779,21 @@ def main() -> None:
                     f"(median = {median_score:.4f})."
                 )
                 logger.info("  Dropped idx → score: " + ", ".join(f"{i}→{s:.3f}" for i, s in dropped))
-                trajectories = [t for t, keep in zip(trajectories, keep_mask) if keep]
+                trajectories      = [t for t, keep in zip(trajectories,      keep_mask) if keep]
+                body_trajectories = [b for b, keep in zip(body_trajectories, keep_mask) if keep]
             else:
                 logger.info(
                     f"Asymmetry filter: no trajectories exceed {args.asymmetry_max_multiple}× median "
                     f"({threshold:.4f}); nothing dropped."
                 )
 
-    # Save as object array so variable-length (N, 6) arrays survive np.load(allow_pickle=True)
+    # Save as object arrays so variable-length per-trajectory arrays survive np.load(allow_pickle=True).
     np.save(data_path, np.array(trajectories, dtype=object))
     logger.info(f"Saved {len(trajectories)} trajectories → {data_path}")
+
+    body_path = body_kinematics_path(os.path.dirname(os.path.abspath(data_path)))
+    np.save(body_path, np.array(body_trajectories, dtype=object))
+    logger.info(f"Saved body kinematics ({len(body_trajectories)} arrays) → {body_path}")
 
     # --- Generate golden template and save both the plot and the .npy ---
     plot_path = os.path.splitext(template_path)[0] + ".png"
@@ -663,14 +818,19 @@ def main() -> None:
         out_path = fixed_len_dataset_path(data_dir, L)
         logger.info(f"Building fixed-length dataset (L={L}) → {out_path}")
         build_fixed_len_dataset(
-            L                      = L,
-            trajectories           = trajectories,
-            template               = template,
-            output_path            = out_path,
-            trajectories_path      = data_path,
-            template_path          = template_path,
-            use_radians            = not args.no_radians,
-            asymmetry_max_multiple = args.asymmetry_max_multiple,
+            L                          = L,
+            trajectories               = trajectories,
+            body_trajectories          = body_trajectories,
+            template                   = template,
+            output_path                = out_path,
+            trajectories_path          = data_path,
+            body_kinematics_path_str   = body_path,
+            template_path              = template_path,
+            use_radians                = not args.no_radians,
+            asymmetry_max_multiple     = args.asymmetry_max_multiple,
+            maneuver_W                 = args.maneuver_W,
+            maneuver_T_coh             = args.maneuver_T_coh,
+            maneuver_T_mag_percentile  = args.maneuver_T_mag_percentile,
         )
 
 
