@@ -30,17 +30,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from transform_data import SA_PHYSICAL_SCALE, _cubic_resample
-
-# Score-bucket ranges. The score is in {0, 1/W, 2/W, ..., 1} with W=4 nominally,
-# plus 1/3 and 2/3 at trajectory edges where only 3 windows cover a wingbeat.
-# Bucketing by ranges (rather than exact discrete values) absorbs both cases.
-_BUCKETS = [
-    ("zero",   lambda s: s == 0.0,                       "score == 0"),
-    ("low",    lambda s: (s > 0.0)  & (s <= 1/3 + 1e-6), "0 < score ≤ 1/3"),
-    ("mid",    lambda s: (s > 1/3 + 1e-6) & (s <= 2/3 + 1e-6), "1/3 < score ≤ 2/3"),
-    ("high",   lambda s: (s > 2/3 + 1e-6) & (s <  1.0),  "2/3 < score < 1"),
-    ("peak",   lambda s: s >= 1.0 - 1e-6,                 "score == 1"),
-]
+from data_handling.maneuver_scoring import BUCKETS, SCORE_AXIS_CHOICES, expand_score_axis, select_score
 
 # (column-name, L-column-index, R-column-index) for the original wing-angle layout
 # [L_phi, L_theta, L_psi, R_phi, R_theta, R_psi].
@@ -68,23 +58,6 @@ def _reconstruct_wing_angles(
     return hat + template_L
 
 
-def _select_score(maneuver_scores: np.ndarray, score_axis: str, channels: list[str]) -> np.ndarray:
-    """
-    Reduce (N, 3) maneuver_scores to a (N,) scalar per the requested axis:
-        max      → max over the three angular channels (default; per-wingbeat difficulty)
-        yaw      → alpha_yaw channel
-        pitch    → alpha_pitch
-        roll     → alpha_roll
-    """
-    if score_axis == "max":
-        return maneuver_scores.max(axis=1)
-    name_map = {"yaw": "alpha_yaw", "pitch": "alpha_pitch", "roll": "alpha_roll"}
-    if score_axis not in name_map:
-        raise ValueError(f"--score_axis must be 'max', 'yaw', 'pitch', or 'roll'; got {score_axis!r}")
-    idx = channels.index(name_map[score_axis])
-    return maneuver_scores[:, idx]
-
-
 def plot_maneuver_buckets(
     npz_path: str,
     template_path: str,
@@ -107,10 +80,10 @@ def plot_maneuver_buckets(
     template_native = np.load(template_path)                          # (template_res, 6) rad
     template_L      = _cubic_resample(template_native, L).astype(np.float64)  # (L, 6) rad
 
-    score = _select_score(maneuver_scores, score_axis, channels)
+    score = select_score(maneuver_scores, score_axis, channels)
     rng = np.random.default_rng(seed)
 
-    n_rows = len(_BUCKETS)
+    n_rows = len(BUCKETS)
     n_cols = len(_ANGLES)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.0 * n_cols, 2.4 * n_rows), sharex=True)
     fig.suptitle(
@@ -122,7 +95,7 @@ def plot_maneuver_buckets(
     phase = np.linspace(0.0, 1.0, L)
     template_deg = np.rad2deg(template_L)
 
-    for row, (name, predicate, description) in enumerate(_BUCKETS):
+    for row, (name, predicate, description) in enumerate(BUCKETS):
         mask = predicate(score)
         idx_pool = np.flatnonzero(mask)
         n_total = idx_pool.size
@@ -174,9 +147,6 @@ def plot_maneuver_buckets(
     print(f"Saved → {out_path}", flush=True)
 
 
-_SCORE_AXIS_CHOICES = ["max", "yaw", "pitch", "roll", "all"]
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.strip(), formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--npz_path",      default="data/wingbeats_L80.npz")
@@ -186,21 +156,14 @@ def main() -> None:
     parser.add_argument("--n_per_bucket",  type=int, default=1)
     parser.add_argument("--seed",          type=int, default=0)
     parser.add_argument(
-        "--score_axis", nargs="+", default=["max"], choices=_SCORE_AXIS_CHOICES,
+        "--score_axis", nargs="+", default=["max"], choices=list(SCORE_AXIS_CHOICES),
         help="One or more of {max, yaw, pitch, roll, all}. 'all' expands to "
              "the other four. Default: max.",
     )
     args = parser.parse_args()
 
-    # Expand 'all' and de-duplicate while preserving order.
-    axes_requested = []
-    for a in args.score_axis:
-        for x in (["max", "yaw", "pitch", "roll"] if a == "all" else [a]):
-            if x not in axes_requested:
-                axes_requested.append(x)
-
     os.makedirs(args.out_dir, exist_ok=True)
-    for axis in axes_requested:
+    for axis in expand_score_axis(args.score_axis):
         out_path = os.path.join(args.out_dir, f"maneuver_buckets_{axis}.png")
         plot_maneuver_buckets(
             npz_path      = args.npz_path,

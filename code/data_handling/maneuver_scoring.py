@@ -30,6 +30,54 @@ import numpy as np
 
 CHANNEL_LABELS = ('alpha_yaw', 'alpha_pitch', 'alpha_roll')
 
+# Bucket cutoffs used by every consumer of maneuver_scores (inspection plots and
+# per-bucket eval) so that visual and numeric reports line up exactly. The score
+# is in {0, 1/W, ..., 1} with W=4 nominally, plus 1/3 and 2/3 at trajectory
+# edges where only 3 windows cover a wingbeat — bucketing by ranges absorbs both.
+BUCKETS: list[tuple[str, "callable", str]] = [
+    ("zero", lambda s: s == 0.0,                                "score == 0"),
+    ("low",  lambda s: (s > 0.0)         & (s <= 1/3 + 1e-6),  "0 < score ≤ 1/3"),
+    ("mid",  lambda s: (s >  1/3 + 1e-6) & (s <= 2/3 + 1e-6),  "1/3 < score ≤ 2/3"),
+    ("high", lambda s: (s >  2/3 + 1e-6) & (s <  1.0),          "2/3 < score < 1"),
+    ("peak", lambda s: s >= 1.0 - 1e-6,                         "score == 1"),
+]
+
+SCORE_AXIS_CHOICES = ("max", "yaw", "pitch", "roll", "all")
+
+
+def select_score(
+    maneuver_scores: np.ndarray,   # (N, C) raw per-channel graded scores
+    score_axis:      str,          # "max" | "yaw" | "pitch" | "roll"
+    channels:        list[str],    # channel labels matching the score columns
+) -> np.ndarray:
+    """
+    Reduce (N, C) maneuver_scores to a (N,) scalar per the requested axis.
+
+    "max"   → max over channels (per-wingbeat aggregate difficulty)
+    "yaw"   → alpha_yaw column
+    "pitch" → alpha_pitch column
+    "roll"  → alpha_roll  column
+    """
+    if score_axis == "max":
+        return maneuver_scores.max(axis=1)
+    name_map = {"yaw": "alpha_yaw", "pitch": "alpha_pitch", "roll": "alpha_roll"}
+    if score_axis not in name_map:
+        raise ValueError(f"score_axis must be one of {{'max','yaw','pitch','roll'}}; got {score_axis!r}")
+    return maneuver_scores[:, channels.index(name_map[score_axis])]
+
+
+def expand_score_axis(axes: list[str]) -> list[str]:
+    """
+    Expand the special 'all' shortcut and dedupe while preserving order.
+    Accepts any of: max, yaw, pitch, roll, all.
+    """
+    out: list[str] = []
+    for a in axes:
+        for x in (["max", "yaw", "pitch", "roll"] if a == "all" else [a]):
+            if x not in out:
+                out.append(x)
+    return out
+
 
 def _trajectory_runs(trajectory_ids: np.ndarray) -> list[tuple[int, int]]:
     """

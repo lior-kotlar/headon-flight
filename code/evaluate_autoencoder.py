@@ -1,14 +1,23 @@
 """
-Standalone reconstruction pipeline for a trained autoencoder.
+Standalone evaluation pipeline for a trained autoencoder.
 
-Loads a saved checkpoint and produces the reconstruction plot (PNG + interactive HTML)
-WITHOUT retraining. Uses only validation trajectories so the visualization isn't biased
-by training-set memorization.
+Loads a saved checkpoint and produces two outputs WITHOUT retraining:
+
+  1. Per-maneuver-bucket reconstruction report. For each maneuver score bucket
+     (zero / low / mid / high / peak), computes normalized MSE and L/R per-angle
+     RMSE in degrees on the validation wingbeats. Prints a table, writes a JSON
+     sidecar, and saves a bar chart. Runs automatically when the npz carries
+     maneuver_scores; skip it with --no_bucket_eval to recover the old behavior.
+
+  2. Reconstruction plot of randomly-chosen consecutive wingbeats from a
+     validation trajectory (this is the original behavior of the script).
 
 Run from the project root:
     python code/evaluate_autoencoder.py
+    python code/evaluate_autoencoder.py --score_axis all        # bucket eval on each axis
+    python code/evaluate_autoencoder.py --no_bucket_eval        # just the reconstruction plot
     python code/evaluate_autoencoder.py --model_dir data/models/autoencoder --n_beats 5
-    python code/evaluate_autoencoder.py --seed 7         # reproducible trajectory choice
+    python code/evaluate_autoencoder.py --seed 7                # reproducible trajectory choice
 """
 
 import argparse
@@ -19,6 +28,8 @@ import numpy as np
 import torch
 
 from autoencoder import WingbeatAutoencoder, _plot_reconstructed_trajectory
+from data_handling.bucket_eval import evaluate_by_maneuver_bucket
+from data_handling.maneuver_scoring import SCORE_AXIS_CHOICES, expand_score_axis
 
 
 def _resolve_model_dir(model_dir: str) -> str:
@@ -94,6 +105,21 @@ def main() -> None:
                              "and recorded in the output filename so the plot stays reproducible.")
     parser.add_argument("--save_dir", default=None,
                         help="Where to save plots. Default: the model's own directory (same dir as the checkpoint).")
+    parser.add_argument(
+        "--score_axis", nargs="+", default=["all"], choices=list(SCORE_AXIS_CHOICES),
+        help="Which score axis to bucket on for the per-bucket eval. 'all' expands to "
+             "max + yaw + pitch + roll (separate tables and bar charts). Default: max.",
+    )
+    parser.add_argument(
+        "--no_bucket_eval", action="store_true",
+        help="Skip the per-maneuver-bucket eval and only produce the reconstruction plot "
+             "(the script's original behavior).",
+    )
+    parser.add_argument(
+        "--npz_path", default=None,
+        help="Path to the fixed-length wingbeat npz. Default: derived from the training "
+             "config's data_path (data/wingbeats_L<output_len>.npz next to trajectories.npy).",
+    )
     args = parser.parse_args()
 
     # Resolve to the latest run_<timestamp>/ if the parent directory was given
@@ -136,6 +162,42 @@ def main() -> None:
     # Default to the model's own directory so plots live alongside the checkpoint they came from.
     save_dir = args.save_dir if args.save_dir is not None else model_dir
     os.makedirs(save_dir, exist_ok=True)
+
+    # --- Per-maneuver-bucket eval (default on; --no_bucket_eval to skip) ---
+    if not args.no_bucket_eval:
+        if args.npz_path is not None:
+            npz_path = args.npz_path
+        else:
+            data_dir = os.path.dirname(os.path.abspath(config['data_path']))
+            npz_path = os.path.join(data_dir, f"wingbeats_L{ckpt['output_len']}.npz")
+        if not os.path.exists(npz_path):
+            print(f"Skipping bucket eval — fixed-length dataset not found at {npz_path}.", flush=True)
+        else:
+            with np.load(npz_path) as probe:
+                has_scores = "maneuver_scores" in probe.files
+            if not has_scores:
+                print(f"Skipping bucket eval — {npz_path} has no maneuver_scores. "
+                      f"Rebuild via transform_data.py --fixed_len {ckpt['output_len']}.", flush=True)
+            else:
+                val_path = os.path.join(model_dir, "val_indices.json")
+                if os.path.exists(val_path):
+                    with open(val_path) as f:
+                        val_trajectory_ids = set(int(i) for i in json.load(f)["val_indices"])
+                else:
+                    np.random.seed(config.get('random_seed', 42))
+                    perm = np.random.permutation(len(trajectories))
+                    n_val = max(1, int(len(trajectories) * config.get('val_split', 0.15)))
+                    val_trajectory_ids = set(int(i) for i in perm[:n_val])
+                for axis in expand_score_axis(args.score_axis):
+                    evaluate_by_maneuver_bucket(
+                        model              = model,
+                        npz_path           = npz_path,
+                        val_trajectory_ids = val_trajectory_ids,
+                        score_axis         = axis,
+                        device             = device,
+                        save_dir           = save_dir,
+                        template_path      = config['template_path'],
+                    )
 
     # Resolve the seed. If the user didn't pass one, draw a random one and record it so
     # the filename always carries the seed that produced the plot.

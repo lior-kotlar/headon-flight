@@ -34,55 +34,19 @@ from transform_data import (
     fixed_len_dataset_path,
     fixed_len_sidecar_path,
 )
+from data_handling.bucket_eval import (
+    WING_ANGLE_LABELS as _WING_ANGLE_LABELS,
+    WING_ANGLE_SCALE  as _WING_ANGLE_SCALE,
+    sa_to_lr_norm     as _sa_to_lr_norm,
+    channel_rmse_to_degrees as _channel_rmse_to_degrees,
+    format_rmse_degrees     as _format_rmse_degrees,
+    evaluate_by_maneuver_bucket,
+)
+from data_handling.maneuver_scoring import expand_score_axis
 
 # Architecture constants
 _BASE_CHANNELS  = 128  # default channels at the deepest conv layer; overridable per model
 _BOTTLENECK_LEN = 12    # temporal length retained at the encoder bottleneck
-
-# Channel labels for human-readable per-channel error reports.
-# Order matches the (B, 6, L) report-tensor channel axis used in the val loop
-# AFTER conversion from S/A back to L/R residuals:
-# [L_phi, L_theta, L_psi, R_phi, R_theta, R_psi].
-_WING_ANGLE_LABELS  = ('L_phi', 'L_theta', 'L_psi', 'R_phi', 'R_theta', 'R_psi')
-# Physical per-angle scale, applied to both L and R (radians):
-# phi (stroke) and psi (rotation) → π; theta (deviation) → 0.5.
-_WING_ANGLE_SCALE   = np.array([np.pi, 0.5, np.pi, np.pi, 0.5, np.pi], dtype=np.float64)
-
-
-def _sa_to_lr_norm(x: torch.Tensor) -> torch.Tensor:
-    """
-    Convert a (B, 6, L) tensor in SA_PHYSICAL_SCALE-normalized S/A coordinates
-    into the corresponding L/R-residual tensor, normalized so each L/R channel
-    has the same physical scale as its angle (_WING_ANGLE_SCALE).
-
-    Derivation: s_norm[c] = S[c] / scale[c], a_norm[c] = A[c] / scale[c], and
-        L_residual = S + A    →    L_norm = s_norm + a_norm
-        R_residual = S - A    →    R_norm = s_norm - a_norm
-    This relies on SA_PHYSICAL_SCALE being symmetric across S and A for each
-    angle (π for φ/ψ, 0.5 for θ), which holds by construction.
-    """
-    s = x[:, :3, :]
-    a = x[:, 3:, :]
-    return torch.cat([s + a, s - a], dim=1)
-
-
-def _channel_rmse_to_degrees(mse_per_channel: np.ndarray) -> np.ndarray:
-    """
-    Convert per-channel MSE measured in _WING_ANGLE_SCALE-normalized L/R space
-    into per-channel RMSE in degrees:
-        rmse_rad = sqrt(mse) * _WING_ANGLE_SCALE
-        rmse_deg = rmse_rad * 180 / pi
-    """
-    rmse_normalized = np.sqrt(np.asarray(mse_per_channel, dtype=np.float64))
-    rmse_rad = rmse_normalized * _WING_ANGLE_SCALE
-    return rmse_rad * (180.0 / np.pi)
-
-
-def _format_rmse_degrees(rmse_deg: np.ndarray) -> str:
-    """Compact per-channel RMSE-degrees readout, L | R split for legibility."""
-    l_part = " ".join(f"{d:.2f}" for d in rmse_deg[:3])
-    r_part = " ".join(f"{d:.2f}" for d in rmse_deg[3:])
-    return f"rmse_deg(L φ/θ/ψ | R φ/θ/ψ)=[{l_part} | {r_part}]  mean={rmse_deg.mean():.2f}"
 _NORM_GROUPS    = 8    # GroupNorm groups; must divide every conv output channel count
 
 
@@ -780,7 +744,10 @@ def main():
     # Some keys hold *complex* values (lists/tuples) as a single unit — for those, a bare
     # list-of-scalars is a single value, while a list-of-lists is a grid over multiple values.
     # Add entries here when adding new config keys that hold a list value.
-    COMPLEX_VALUE_KEYS = {'channel_loss_weight'}  # value is (alpha_s, alpha_a)
+    COMPLEX_VALUE_KEYS = {
+        'channel_loss_weight',              # value is (alpha_s, alpha_a)
+        'post_training_bucket_eval_axes',   # value is a list of score axes, not a sweep dim
+    }
 
     fixed: dict = {}
     grid:  dict = {}
@@ -1072,6 +1039,7 @@ def main():
         output_len=fixed_len_L,
     )
     best_model.load_state_dict(best_autoencoder_state)
+    best_model.to(device)
     _plot_reconstructed_trajectory(
         model      = best_model,
         val_trajs  = val_trajs,
@@ -1080,6 +1048,23 @@ def main():
         device     = device,
         seed       = seed,
     )
+
+    # --- Bucket eval on the overall best model. Same axes as the per-config eval.
+    # Output files have no run-label prefix so this matches the manual evaluator.
+    bucket_axes = fixed.get('post_training_bucket_eval_axes', ['max'])
+    if bucket_axes:
+        for axis in expand_score_axis(list(bucket_axes)):
+            evaluate_by_maneuver_bucket(
+                model              = best_model,
+                npz_path           = fl_dataset_path,
+                val_trajectory_ids = set(int(i) for i in val_indices),
+                score_axis         = axis,
+                device             = device,
+                save_dir           = save_dir,
+                file_prefix        = "",
+                print_table        = True,
+                template_path      = fixed['template_path'],
+            )
 
     print(f"\n{'=' * 45}")
     print(f"Grid search complete.")
