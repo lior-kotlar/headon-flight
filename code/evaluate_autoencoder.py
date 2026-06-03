@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 from autoencoder import WingbeatAutoencoder, _plot_reconstructed_trajectory
-from data_handling.bucket_eval import evaluate_by_maneuver_bucket
+from data_handling.bucket_eval import evaluate_by_maneuver_bucket, plot_per_phase_error
 from data_handling.maneuver_scoring import SCORE_AXIS_CHOICES, expand_score_axis
 
 
@@ -188,6 +188,14 @@ def main() -> None:
                     perm = np.random.permutation(len(trajectories))
                     n_val = max(1, int(len(trajectories) * config.get('val_split', 0.15)))
                     val_trajectory_ids = set(int(i) for i in perm[:n_val])
+                # Per-phase error plot is independent of score_axis, so run it once.
+                plot_per_phase_error(
+                    model              = model,
+                    npz_path           = npz_path,
+                    val_trajectory_ids = val_trajectory_ids,
+                    device             = device,
+                    save_dir           = save_dir,
+                )
                 for axis in expand_score_axis(args.score_axis):
                     evaluate_by_maneuver_bucket(
                         model              = model,

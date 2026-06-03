@@ -41,6 +41,7 @@ from data_handling.bucket_eval import (
     channel_rmse_to_degrees as _channel_rmse_to_degrees,
     format_rmse_degrees     as _format_rmse_degrees,
     evaluate_by_maneuver_bucket,
+    plot_per_phase_error,
 )
 from data_handling.maneuver_scoring import expand_score_axis
 
@@ -1053,6 +1054,14 @@ def main():
     # Output files have no run-label prefix so this matches the manual evaluator.
     bucket_axes = fixed.get('post_training_bucket_eval_axes', ['max'])
     if bucket_axes:
+        # Per-phase error plot is independent of score_axis, so run it once.
+        plot_per_phase_error(
+            model              = best_model,
+            npz_path           = fl_dataset_path,
+            val_trajectory_ids = set(int(i) for i in val_indices),
+            device             = device,
+            save_dir           = save_dir,
+        )
         for axis in expand_score_axis(list(bucket_axes)):
             evaluate_by_maneuver_bucket(
                 model              = best_model,

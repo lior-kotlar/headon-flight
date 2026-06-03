@@ -118,6 +118,110 @@ def _run_model_on_bucket(
     return float(norm_mse), mse_per_channel_lr
 
 
+def plot_per_phase_error(
+    model: nn.Module,
+    npz_path: str,
+    val_trajectory_ids: set[int],
+    device: str,
+    save_dir: str,
+    file_prefix: str = "",
+    batch_size: int = 256,
+) -> dict:
+    """
+    Per-phase signed reconstruction error across the validation set.
+
+    For each phase position t and L/R-wing-angle channel c, computes:
+        mean[c, t] = mean over val wingbeats of (recon - target) in degrees
+        std [c, t] = std  over val wingbeats of (recon - target) in degrees
+
+    Emits one figure with 3 subplots (one per angle: φ, θ, ψ), each showing
+    L (blue) and R (red) signed-error curves with ±1 std bands and a y=0
+    reference line. Bias direction is read off the sign of the mean curve;
+    band height shows how consistent that bias is across wingbeats.
+
+    Saves PNG + a JSON sidecar with the mean/std arrays. Returns the sidecar dict.
+    """
+    d              = np.load(npz_path)
+    sa_all         = d["sa_wingbeats"]
+    trajectory_ids = d["trajectory_ids"]
+    L              = sa_all.shape[2]
+
+    val_mask = np.isin(trajectory_ids, np.array(sorted(val_trajectory_ids), dtype=trajectory_ids.dtype))
+    sa_val   = sa_all[val_mask]                                                # (N_val, 6, L)
+    n_val    = sa_val.shape[0]
+    if n_val == 0:
+        raise ValueError("plot_per_phase_error: no validation wingbeats matched the trajectory_ids set.")
+
+    scale_deg = WING_ANGLE_SCALE * (180.0 / np.pi)                             # (6,)
+
+    # Accumulate signed errors in degrees over the val set.
+    all_errs_deg = np.empty((n_val, 6, L), dtype=np.float32)
+    model.eval()
+    with torch.no_grad():
+        for s in range(0, n_val, batch_size):
+            x       = torch.as_tensor(sa_val[s:s + batch_size], dtype=torch.float32, device=device)
+            recon   = model(x)
+            diff_lr = (sa_to_lr_norm(recon) - sa_to_lr_norm(x)).cpu().numpy()  # (B, 6, L)
+            all_errs_deg[s:s + diff_lr.shape[0]] = (
+                diff_lr.astype(np.float64) * scale_deg[None, :, None] * 1.0
+            ).astype(np.float32)
+
+    mean_deg = all_errs_deg.mean(axis=0)                                       # (6, L)
+    std_deg  = all_errs_deg.std (axis=0)                                       # (6, L)
+
+    phase = np.linspace(0.0, 1.0, L)
+    fig, axes = plt.subplots(len(_PLOT_ANGLES), 1, figsize=(9.5, 8.0), sharex=True)
+    fig.suptitle(
+        f"Per-phase signed reconstruction error  (n_val_wingbeats={n_val})",
+        fontsize=14,
+    )
+    for row, (angle_label, L_col, R_col) in enumerate(_PLOT_ANGLES):
+        ax = axes[row]
+        # y=0 reference: bias direction is read off the sign relative to this line.
+        ax.axhline(0.0, color="0.4", linestyle="--", lw=1.0, alpha=0.7)
+
+        ax.plot(phase, mean_deg[L_col], color="tab:blue", lw=1.6, label="Left wing")
+        ax.fill_between(
+            phase,
+            mean_deg[L_col] - std_deg[L_col], mean_deg[L_col] + std_deg[L_col],
+            color="tab:blue", alpha=0.20, linewidth=0,
+        )
+        ax.plot(phase, mean_deg[R_col], color="tab:red",  lw=1.6, label="Right wing")
+        ax.fill_between(
+            phase,
+            mean_deg[R_col] - std_deg[R_col], mean_deg[R_col] + std_deg[R_col],
+            color="tab:red", alpha=0.20, linewidth=0,
+        )
+        ax.set_ylabel(f"{angle_label}\nerror [deg]", fontsize=10)
+        ax.grid(True, alpha=0.4)
+        if row == 0:
+            ax.legend(loc="upper right", fontsize=9)
+    axes[-1].set_xlabel("Normalized phase")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    name_stem = f"{file_prefix}per_phase_error" if file_prefix else "per_phase_error"
+    os.makedirs(save_dir, exist_ok=True)
+    png_path = os.path.join(save_dir, f"{name_stem}.png")
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    sidecar = {
+        "n_val_wingbeats":   int(n_val),
+        "L":                 int(L),
+        "channel_labels":    list(WING_ANGLE_LABELS),
+        "mean_deg":          mean_deg.tolist(),
+        "std_deg":           std_deg.tolist(),
+        "evaluated_at":      datetime.now().isoformat(timespec="seconds"),
+    }
+    json_path = os.path.join(save_dir, f"{name_stem}.json")
+    with open(json_path, "w") as f:
+        json.dump(sidecar, f, indent=2)
+
+    print(f"  → wrote {png_path}", flush=True)
+    print(f"  → wrote {json_path}", flush=True)
+    return sidecar
+
+
 def _reconstruct_wing_angles_from_normalized_sa(
     sa_norm: np.ndarray,        # (6, L) normalized SA, channels-first
     template_L: np.ndarray,     # (L, 6) golden template resampled to L, radians
