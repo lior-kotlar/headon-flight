@@ -205,12 +205,18 @@ def plot_per_phase_error(
     fig.savefig(png_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
+    # Persist the raw (N_val, 6, L) signed-error tensor so any later analysis
+    # (e.g. plot_phase_range_distributions) can slice it without re-running the model.
+    errs_npy_path = os.path.join(save_dir, f"{name_stem}_errors.npy")
+    np.save(errs_npy_path, all_errs_deg)
+
     sidecar = {
         "n_val_wingbeats":   int(n_val),
         "L":                 int(L),
         "channel_labels":    list(WING_ANGLE_LABELS),
         "mean_deg":          mean_deg.tolist(),
         "std_deg":           std_deg.tolist(),
+        "errors_npy_path":   errs_npy_path,
         "evaluated_at":      datetime.now().isoformat(timespec="seconds"),
     }
     json_path = os.path.join(save_dir, f"{name_stem}.json")
@@ -218,8 +224,101 @@ def plot_per_phase_error(
         json.dump(sidecar, f, indent=2)
 
     print(f"  → wrote {png_path}", flush=True)
+    print(f"  → wrote {errs_npy_path}", flush=True)
     print(f"  → wrote {json_path}", flush=True)
-    return sidecar
+    # Caller can use `errors_deg` directly to drive plot_phase_range_distributions
+    # without re-reading the .npy file we just wrote.
+    return {**sidecar, "errors_deg": all_errs_deg}
+
+
+def plot_phase_range_distributions(
+    errors_deg:   np.ndarray,                       # (N_val, 6, L) signed error in degrees
+    phase_ranges: list[tuple[float, float]],
+    save_dir:     str,
+    file_prefix:  str = "",
+    bins:         int = 50,
+) -> str:
+    """
+    Histogram of signed reconstruction errors restricted to user-chosen phase
+    windows. Layout: 3 rows × 2 cols (angle × wing). Each cell overlays one
+    density-normalized histogram per requested range (color-graded with
+    viridis), with vertical lines at the per-range mean and a dashed black
+    line at error=0 for bias direction.
+
+    Returns the path to the saved PNG.
+    """
+    n_val, n_channels, L = errors_deg.shape
+    phase_axis = np.linspace(0.0, 1.0, L)
+
+    range_masks: list[tuple[float, float, np.ndarray]] = []
+    for lo, hi in phase_ranges:
+        mask = (phase_axis >= float(lo)) & (phase_axis <= float(hi))
+        range_masks.append((float(lo), float(hi), mask))
+
+    fig, axes = plt.subplots(3, 2, figsize=(11.5, 8.5), sharex=False)
+    range_labels = [f"[{lo:.2f}, {hi:.2f}]" for lo, hi, _ in range_masks]
+    fig.suptitle(
+        f"Signed error distributions per phase window  "
+        f"(n_val_wingbeats={n_val}, ranges={range_labels})",
+        fontsize=13,
+    )
+
+    # tab10 is a qualitative (categorical) palette — neighboring entries are
+    # maximally perceptually distinct, which is what we want here since the
+    # phase windows are discrete categories, not a continuous ordering.
+    _tab10  = plt.get_cmap("tab10").colors
+    palette = [_tab10[i % len(_tab10)] for i in range(max(len(range_masks), 1))]
+    wing_labels = ["Left wing", "Right wing"]
+
+    for col_wing in (0, 1):
+        for row, (angle_label, L_col, R_col) in enumerate(_PLOT_ANGLES):
+            ax = axes[row, col_wing]
+            ch = L_col if col_wing == 0 else R_col
+            # Pool the errors from every requested range so the bin range covers
+            # them all — that lets overlaid histograms be visually comparable.
+            pooled = np.concatenate(
+                [errors_deg[:, ch, mask].ravel() for _, _, mask in range_masks if mask.any()]
+            ) if any(mask.any() for _, _, mask in range_masks) else np.empty(0)
+            if pooled.size == 0:
+                ax.text(0.5, 0.5, "no samples", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=10, color="gray")
+                ax.set_yticks([])
+                continue
+            lo_v, hi_v = np.percentile(pooled, [0.5, 99.5])
+            bin_edges  = np.linspace(lo_v, hi_v, bins + 1)
+            ax.axvline(0.0, color="black", linestyle="--", lw=1.0, alpha=0.7)
+            for (lo, hi, mask), color in zip(range_masks, palette):
+                if not mask.any():
+                    continue
+                errs = errors_deg[:, ch, mask].ravel()
+                ax.hist(errs, bins=bin_edges, alpha=0.50, density=True,
+                        color=color, label=f"[{lo:.2f}, {hi:.2f}]  μ={errs.mean():+.2f}°")
+                ax.axvline(errs.mean(), color=color, lw=1.4, alpha=0.95)
+            ax.set_xlabel(f"{angle_label} error [deg]")
+            if col_wing == 0:
+                ax.set_ylabel("density")
+            ax.grid(True, alpha=0.4)
+            if row == 0:
+                ax.set_title(wing_labels[col_wing], fontsize=11)
+            if row == 0 and col_wing == 1:
+                ax.legend(title="Phase range", fontsize=8, loc="upper right")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    name_stem = f"{file_prefix}per_phase_error_distribution" if file_prefix else "per_phase_error_distribution"
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, f"{name_stem}.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → wrote {out_path}", flush=True)
+    return out_path
+
+
+# Default phase-window partition used when no custom ranges are supplied.
+# Four equal quarters span the entire wingbeat and make phase-dependent
+# structure of the error distribution legible at a glance.
+DEFAULT_PHASE_RANGES: list[tuple[float, float]] = [
+    (0.00, 0.20), (0.2, 0.40), (0.40, 0.60), (0.60, 0.80), (0.80, 1.00)
+]
 
 
 def _reconstruct_wing_angles_from_normalized_sa(

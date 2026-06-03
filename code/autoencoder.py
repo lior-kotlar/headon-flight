@@ -42,6 +42,8 @@ from data_handling.bucket_eval import (
     format_rmse_degrees     as _format_rmse_degrees,
     evaluate_by_maneuver_bucket,
     plot_per_phase_error,
+    plot_phase_range_distributions,
+    DEFAULT_PHASE_RANGES,
 )
 from data_handling.maneuver_scoring import expand_score_axis
 
@@ -829,12 +831,17 @@ def _save_per_dim_artifacts(
     )
 
     if bucket_axes:
-        plot_per_phase_error(
+        per_phase = plot_per_phase_error(
             model              = model,
             npz_path           = fl_dataset_path,
             val_trajectory_ids = set(int(i) for i in val_indices),
             device             = device,
             save_dir           = target_dir,
+        )
+        plot_phase_range_distributions(
+            errors_deg   = per_phase["errors_deg"],
+            phase_ranges = list(DEFAULT_PHASE_RANGES),
+            save_dir     = target_dir,
         )
         for axis in expand_score_axis(list(bucket_axes)):
             evaluate_by_maneuver_bucket(
@@ -892,57 +899,73 @@ def main():
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    # --- Resolve the fixed-length dataset path; auto-build if missing or stale ---
-    fixed_len_L      = int(fixed['fixed_len'])
-    auto_build       = bool(fixed.get('auto_build_dataset', True))
-    data_dir         = os.path.dirname(os.path.abspath(fixed['data_path']))
-    fl_dataset_path  = fixed_len_dataset_path(data_dir, fixed_len_L)
-    fl_sidecar_path  = fixed_len_sidecar_path(data_dir, fixed_len_L)
-
-    is_valid, reason = fixed_len_dataset_is_valid(
-        output_path       = fl_dataset_path,
-        sidecar_path      = fl_sidecar_path,
-        L                 = fixed_len_L,
-        trajectories_path = fixed['data_path'],
-        template_path     = fixed['template_path'],
-    )
-    if not is_valid:
-        if not auto_build:
-            raise FileNotFoundError(
-                f"Fixed-length dataset at {fl_dataset_path} is missing or stale ({reason}). "
-                f"Either set auto_build_dataset=true in the config, or run "
-                f"`python code/transform_data.py --fixed_len {fixed_len_L}` to build it."
-            )
-        print(f"Building fixed-length dataset (L={fixed_len_L}): {reason} → {fl_dataset_path}", flush=True)
-        build_fixed_len_dataset_from_disk(
-            L                 = fixed_len_L,
+    # --- Auto-build every fixed-length dataset the grid will reference ---
+    # fixed_len may be a sweep dim, so collect all unique L values that any combo
+    # will request, then build the ones that are missing or stale.
+    unique_fixed_lens = sorted({
+        int({**fixed, **dict(zip(grid_keys, c))}['fixed_len']) for c in combos
+    })
+    auto_build = bool(fixed.get('auto_build_dataset', True))
+    data_dir   = os.path.dirname(os.path.abspath(fixed['data_path']))
+    for L_val in unique_fixed_lens:
+        path = fixed_len_dataset_path(data_dir, L_val)
+        scar = fixed_len_sidecar_path(data_dir, L_val)
+        is_valid, reason = fixed_len_dataset_is_valid(
+            output_path       = path,
+            sidecar_path      = scar,
+            L                 = L_val,
             trajectories_path = fixed['data_path'],
             template_path     = fixed['template_path'],
-            output_path       = fl_dataset_path,
         )
+        if not is_valid:
+            if not auto_build:
+                raise FileNotFoundError(
+                    f"Fixed-length dataset at {path} is missing or stale ({reason}). "
+                    f"Either set auto_build_dataset=true in the config, or run "
+                    f"`python code/transform_data.py --fixed_len {L_val}` to build it."
+                )
+            print(f"Building fixed-length dataset (L={L_val}): {reason} → {path}", flush=True)
+            build_fixed_len_dataset_from_disk(
+                L                 = L_val,
+                trajectories_path = fixed['data_path'],
+                template_path     = fixed['template_path'],
+                output_path       = path,
+            )
 
-    # --- Load fixed-length wingbeats and the trajectory IDs (for the split) ---
-    fl_data        = np.load(fl_dataset_path)
-    sa_wingbeats   = fl_data['sa_wingbeats']       # (N, 6, L) float32, already normalized
-    trajectory_ids = fl_data['trajectory_ids']     # (N,) int32 — index into trajectories.npy
-    template       = np.load(fixed['template_path'])  # still needed for the reconstruction plot
-    trajectories   = np.load(fixed['data_path'], allow_pickle=True)
-    n_trajs        = len(trajectories)
+    # --- L-agnostic state: template + trajectory list + train/val split (trajectory level) ---
+    # The train/val split is on trajectory_ids, which are identical across L values
+    # (CubicSpline resampling doesn't change which wingbeats exist, only how many
+    # time samples each has). So one split is reused for every L.
+    template     = np.load(fixed['template_path'])
+    trajectories = np.load(fixed['data_path'], allow_pickle=True)
+    n_trajs      = len(trajectories)
 
-    # Split at trajectory level to prevent leakage between wingbeats of the same flight.
     n_val         = max(1, int(n_trajs * fixed.get('val_split', 0.15)))
     perm          = np.random.permutation(n_trajs)
     val_indices   = perm[:n_val].tolist()
     train_indices = perm[n_val:].tolist()
     val_traj_set  = set(int(i) for i in val_indices)
+    val_trajs     = [trajectories[i] for i in val_indices]
 
-    val_mask    = np.array([int(t) in val_traj_set for t in trajectory_ids], dtype=bool)
-    train_dataset = FixedLenWingbeatDataset(sa_wingbeats[~val_mask])
-    val_dataset   = FixedLenWingbeatDataset(sa_wingbeats[ val_mask])
-    val_trajs     = [trajectories[i] for i in val_indices]   # still needed for the visual plot
+    # --- Lazy per-L dataset cache. Each unique L value's wingbeats are loaded
+    # at most once across the entire grid (e.g., when L=45 is shared between
+    # combos sweeping latent_dim, the npz is loaded a single time).
+    _dataset_cache: dict[int, tuple['FixedLenWingbeatDataset', 'FixedLenWingbeatDataset', str]] = {}
+
+    def _get_datasets_for_L(L_val: int) -> tuple['FixedLenWingbeatDataset', 'FixedLenWingbeatDataset', str]:
+        if L_val not in _dataset_cache:
+            path           = fixed_len_dataset_path(data_dir, L_val)
+            fl_data        = np.load(path)
+            sa_wingbeats   = fl_data['sa_wingbeats']       # (N, 6, L) float32, normalized
+            trajectory_ids = fl_data['trajectory_ids']
+            val_mask       = np.array([int(t) in val_traj_set for t in trajectory_ids], dtype=bool)
+            train_ds       = FixedLenWingbeatDataset(sa_wingbeats[~val_mask])
+            val_ds         = FixedLenWingbeatDataset(sa_wingbeats[ val_mask])
+            _dataset_cache[L_val] = (train_ds, val_ds, path)
+        return _dataset_cache[L_val]
 
     print(f"Trajectories : {len(train_indices)} train / {n_val} val (out of {n_trajs} total)")
-    print(f"Wingbeats    : {len(train_dataset)} train / {len(val_dataset)} val (L={fixed_len_L})")
+    print(f"Fixed-L values requested: {unique_fixed_lens}")
 
     device = fixed.get('device', 'auto')
     if device == 'auto':
@@ -976,10 +999,13 @@ def main():
     best_decoder_state   = None
     best_autoencoder_state = None
     best_run_val_rmse_deg: np.ndarray | None = None
-    # Per-latent-dim best across the grid: each entry is the winning config among
-    # all grid combos that share that latent_dim. Persisted after the grid loop so
-    # downstream interpretability experiments can compare reconstructions across dims.
-    per_dim_best: dict[int, dict] = {}
+    # Per-(fixed_len, latent_dim) best across the grid: each entry is the winner
+    # among all grid combos that share that (L, latent_dim) pair. After the grid
+    # loop, these are persisted into nested subdirectories so interpretability
+    # experiments can compare across either axis cleanly. The key is always a
+    # (L, latent_dim) tuple; when one or both dims are scalar in the config,
+    # the resulting subdir layout collapses appropriately (see the save block).
+    per_combo_best: dict[tuple[int, int], dict] = {}
 
     def _build_model(rcfg: dict) -> WingbeatAutoencoder:
         return WingbeatAutoencoder(
@@ -995,6 +1021,11 @@ def main():
     for run_idx, combo in enumerate(combos):
         run_config = {**fixed, **dict(zip(grid_keys, combo))}
         print(f"\n--- Run {run_idx + 1}/{n_runs} | {dict(zip(grid_keys, combo))} ---", flush=True)
+
+        # Fetch this combo's fixed-L datasets (cached so identical-L combos reuse them).
+        combo_L = int(run_config['fixed_len'])
+        train_dataset, val_dataset, fl_dataset_path = _get_datasets_for_L(combo_L)
+        print(f"  L={combo_L}: {len(train_dataset)} train / {len(val_dataset)} val wingbeats", flush=True)
 
         # Restart-on-plateau settings: when enabled, training aborts early at
         # `restart_check_epoch` if the best val loss is still above `restart_threshold`,
@@ -1077,17 +1108,19 @@ def main():
             best_autoencoder_state = copy.deepcopy(best_state)
             best_run_val_rmse_deg  = best_val_rmse_deg
 
-        # Track the best across all configs sharing this latent_dim — used after
-        # the grid completes to write one checkpoint per unique latent_dim value.
-        ld = int(run_config['latent_dim'])
-        prev = per_dim_best.get(ld)
+        # Track the best across all configs sharing this (fixed_len, latent_dim)
+        # pair. After the grid completes we persist one checkpoint per pair into
+        # an appropriately nested subdir.
+        combo_key = (combo_L, int(run_config['latent_dim']))
+        prev = per_combo_best.get(combo_key)
         if prev is None or run_best < prev['val_loss']:
-            per_dim_best[ld] = {
+            per_combo_best[combo_key] = {
                 'val_loss':          run_best,
                 'run_config':        run_config,
                 'autoencoder_state': copy.deepcopy(best_state),
                 'decoder_state':     copy.deepcopy(model.decoder.state_dict()),
                 'val_rmse_deg':      best_val_rmse_deg,
+                'fl_dataset_path':   fl_dataset_path,
             }
 
     # --- Persist results ---
@@ -1108,6 +1141,9 @@ def main():
     val_rmse_deg_list = (
         None if best_run_val_rmse_deg is None else [float(v) for v in best_run_val_rmse_deg]
     )
+    # Overall-best L may differ from any individual combo's L when fixed_len is swept.
+    best_fixed_len_L     = int(best_run_config['fixed_len'])
+    best_fl_dataset_path = fixed_len_dataset_path(data_dir, best_fixed_len_L)
     torch.save(
         {
             'state_dict':          best_decoder_state,
@@ -1117,7 +1153,7 @@ def main():
             'base_channels':       best_base_channels,
             'bottleneck_len':      best_bottleneck_len,
             'decoder_kernel_size': best_decoder_kernel_size,
-            'output_len':          fixed_len_L,
+            'output_len':          best_fixed_len_L,
             'sa_scale':            sa_scale_list,
             'val_loss':            best_val_loss,
             'val_rmse_deg':        val_rmse_deg_list,
@@ -1141,7 +1177,7 @@ def main():
             'derivative_weight':   best_derivative_weight,
             'bottleneck_len':      best_bottleneck_len,
             'decoder_kernel_size': best_decoder_kernel_size,
-            'output_len':          fixed_len_L,
+            'output_len':          best_fixed_len_L,
             'sa_scale':            sa_scale_list,
             'val_loss':            best_val_loss,
             'val_rmse_deg':        val_rmse_deg_list,
@@ -1177,7 +1213,7 @@ def main():
         base_channels=best_base_channels,
         bottleneck_len=best_bottleneck_len,
         decoder_kernel_size=best_decoder_kernel_size,
-        output_len=fixed_len_L,
+        output_len=best_fixed_len_L,
     )
     best_model.load_state_dict(best_autoencoder_state)
     best_model.to(device)
@@ -1195,17 +1231,25 @@ def main():
     bucket_axes = fixed.get('post_training_bucket_eval_axes', ['max'])
     if bucket_axes:
         # Per-phase error plot is independent of score_axis, so run it once.
-        plot_per_phase_error(
+        # We pass best_fl_dataset_path — the npz for the best model's L.
+        per_phase = plot_per_phase_error(
             model              = best_model,
-            npz_path           = fl_dataset_path,
+            npz_path           = best_fl_dataset_path,
             val_trajectory_ids = set(int(i) for i in val_indices),
             device             = device,
             save_dir           = save_dir,
         )
+        # Phase-window error histograms — driven by the same raw-error tensor
+        # plot_per_phase_error already produced, so no extra model pass.
+        plot_phase_range_distributions(
+            errors_deg   = per_phase["errors_deg"],
+            phase_ranges = list(DEFAULT_PHASE_RANGES),
+            save_dir     = save_dir,
+        )
         for axis in expand_score_axis(list(bucket_axes)):
             evaluate_by_maneuver_bucket(
                 model              = best_model,
-                npz_path           = fl_dataset_path,
+                npz_path           = best_fl_dataset_path,
                 val_trajectory_ids = set(int(i) for i in val_indices),
                 score_axis         = axis,
                 device             = device,
@@ -1215,25 +1259,43 @@ def main():
                 template_path      = fixed['template_path'],
             )
 
-    # --- Per-latent-dim subdirectories (only when latent_dim was actually swept) ---
-    # For each unique latent_dim value, we already tracked the best-across-all-other-
-    # hyperparams config inside the grid loop. Write each into its own subdir with
-    # the full eval suite so they can be loaded and compared independently.
-    unique_dims = sorted(per_dim_best.keys())
-    if len(unique_dims) > 1:
-        print(f"\nSaving per-latent-dim winners ({len(unique_dims)} dims) under {save_dir}", flush=True)
-        for ld in unique_dims:
-            info = per_dim_best[ld]
+    # --- Per-(fixed_len, latent_dim) subdirectories ------------------------
+    # Layout depends on which dimensions were swept:
+    #   * Both L and latent_dim swept  → nested fixed_len_<L>/latent_dim_<k>/
+    #   * Only fixed_len swept         → flat   fixed_len_<L>/
+    #   * Only latent_dim swept        → flat   latent_dim_<k>/      (legacy layout)
+    #   * Neither swept                → no subdirs (only the top-level overall best)
+    # The "winner" for each cell is the best run across every other grid dim
+    # (e.g., seed, base_channels, ...) for that (L, latent_dim) pair.
+    unique_L_in_grid  = sorted({L for (L, _)  in per_combo_best.keys()})
+    unique_LD_in_grid = sorted({ld for (_, ld) in per_combo_best.keys()})
+    L_swept           = len(unique_L_in_grid)  > 1
+    LD_swept          = len(unique_LD_in_grid) > 1
+
+    if L_swept or LD_swept:
+        print(
+            f"\nSaving per-combo winners under {save_dir}  "
+            f"({len(per_combo_best)} cell(s), L_swept={L_swept}, LD_swept={LD_swept})",
+            flush=True,
+        )
+        for (L_val, ld_val) in sorted(per_combo_best.keys()):
+            info = per_combo_best[(L_val, ld_val)]
+            if L_swept and LD_swept:
+                target_dir = os.path.join(save_dir, f"fixed_len_{L_val}", f"latent_dim_{ld_val}")
+            elif L_swept:
+                target_dir = os.path.join(save_dir, f"fixed_len_{L_val}")
+            else:
+                target_dir = os.path.join(save_dir, f"latent_dim_{ld_val}")
             _save_per_dim_artifacts(
-                target_dir       = os.path.join(save_dir, f"latent_dim_{ld}"),
+                target_dir       = target_dir,
                 run_config       = info['run_config'],
                 ae_state         = info['autoencoder_state'],
                 dec_state        = info['decoder_state'],
                 val_rmse_deg     = info['val_rmse_deg'],
                 val_loss         = info['val_loss'],
-                fixed_len_L      = fixed_len_L,
+                fixed_len_L      = L_val,
                 val_indices      = val_indices,
-                fl_dataset_path  = fl_dataset_path,
+                fl_dataset_path  = info['fl_dataset_path'],
                 template         = template,
                 template_path    = fixed['template_path'],
                 val_trajs        = val_trajs,

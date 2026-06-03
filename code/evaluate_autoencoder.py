@@ -28,7 +28,12 @@ import numpy as np
 import torch
 
 from autoencoder import WingbeatAutoencoder, _plot_reconstructed_trajectory
-from data_handling.bucket_eval import evaluate_by_maneuver_bucket, plot_per_phase_error
+from data_handling.bucket_eval import (
+    evaluate_by_maneuver_bucket,
+    plot_per_phase_error,
+    plot_phase_range_distributions,
+    DEFAULT_PHASE_RANGES,
+)
 from data_handling.maneuver_scoring import SCORE_AXIS_CHOICES, expand_score_axis
 
 
@@ -120,7 +125,20 @@ def main() -> None:
         help="Path to the fixed-length wingbeat npz. Default: derived from the training "
              "config's data_path (data/wingbeats_L<output_len>.npz next to trajectories.npy).",
     )
+    parser.add_argument(
+        "--phase_ranges", nargs="+", default=None,
+        help="One or more phase-window ranges as 'lo,hi' (each in [0, 1]) for the "
+             "error-distribution histogram. Default: four equal quarters of the wingbeat.",
+    )
     args = parser.parse_args()
+
+    if args.phase_ranges:
+        phase_ranges: list[tuple[float, float]] = []
+        for r in args.phase_ranges:
+            lo_str, hi_str = r.split(",")
+            phase_ranges.append((float(lo_str), float(hi_str)))
+    else:
+        phase_ranges = list(DEFAULT_PHASE_RANGES)
 
     # Resolve to the latest run_<timestamp>/ if the parent directory was given
     model_dir   = _resolve_model_dir(args.model_dir)
@@ -189,12 +207,17 @@ def main() -> None:
                     n_val = max(1, int(len(trajectories) * config.get('val_split', 0.15)))
                     val_trajectory_ids = set(int(i) for i in perm[:n_val])
                 # Per-phase error plot is independent of score_axis, so run it once.
-                plot_per_phase_error(
+                per_phase = plot_per_phase_error(
                     model              = model,
                     npz_path           = npz_path,
                     val_trajectory_ids = val_trajectory_ids,
                     device             = device,
                     save_dir           = save_dir,
+                )
+                plot_phase_range_distributions(
+                    errors_deg   = per_phase["errors_deg"],
+                    phase_ranges = phase_ranges,
+                    save_dir     = save_dir,
                 )
                 for axis in expand_score_axis(args.score_axis):
                     evaluate_by_maneuver_bucket(
