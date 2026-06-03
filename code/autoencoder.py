@@ -727,6 +727,129 @@ def _save_reconstruction_plotly(
     fig.write_html(html_path, include_plotlyjs='cdn')
     print(f"Interactive reconstruction plot saved → {html_path}", flush=True)
 
+
+def _save_per_dim_artifacts(
+    target_dir: str,
+    run_config: dict,
+    ae_state: dict,
+    dec_state: dict,
+    val_rmse_deg: np.ndarray | None,
+    val_loss: float,
+    fixed_len_L: int,
+    val_indices: list,
+    fl_dataset_path: str,
+    template: np.ndarray,
+    template_path: str,
+    val_trajs: list,
+    seed: int,
+    device: str,
+    bucket_axes: list,
+) -> None:
+    """
+    Write a per-latent-dim model checkpoint into `target_dir`, plus run the same
+    eval suite (reconstruction plot, per-phase error, per-bucket eval) as the
+    top-level overall-best save.
+
+    Used after the grid loop to emit one self-contained subdirectory per
+    unique latent_dim value, so each can be loaded and inspected independently.
+    """
+    os.makedirs(target_dir, exist_ok=True)
+
+    activation     = run_config.get('activation', 'gelu')
+    dropout        = run_config.get('dropout', 0.0)
+    base_channels  = run_config.get('base_channels', _BASE_CHANNELS)
+    bottleneck_len = run_config.get('bottleneck_len', _BOTTLENECK_LEN)
+    decoder_kernel = run_config.get('decoder_kernel_size', 5)
+    channel_w      = run_config.get('channel_loss_weight')
+    cycle_w        = run_config.get('cycle_weight', 0.0)
+    endpoint_w     = run_config.get('endpoint_weight', 1.0)
+    endpoint_s     = run_config.get('endpoint_samples', 3)
+    derivative_w   = run_config.get('derivative_weight', 0.0)
+    latent_dim     = int(run_config['latent_dim'])
+    sa_scale_list  = SA_PHYSICAL_SCALE.tolist()
+    val_rmse_list  = None if val_rmse_deg is None else [float(v) for v in val_rmse_deg]
+
+    torch.save({
+        'state_dict':          dec_state,
+        'latent_dim':          latent_dim,
+        'activation':          activation,
+        'dropout':             dropout,
+        'base_channels':       base_channels,
+        'bottleneck_len':      bottleneck_len,
+        'decoder_kernel_size': decoder_kernel,
+        'output_len':          fixed_len_L,
+        'sa_scale':            sa_scale_list,
+        'val_loss':            val_loss,
+        'val_rmse_deg':        val_rmse_list,
+        'channel_labels':      list(_WING_ANGLE_LABELS),
+    }, os.path.join(target_dir, 'best_decoder.pt'))
+
+    torch.save({
+        'state_dict':          ae_state,
+        'latent_dim':          latent_dim,
+        'activation':          activation,
+        'dropout':             dropout,
+        'base_channels':       base_channels,
+        'channel_loss_weight': channel_w,
+        'cycle_weight':        cycle_w,
+        'endpoint_weight':     endpoint_w,
+        'endpoint_samples':    endpoint_s,
+        'derivative_weight':   derivative_w,
+        'bottleneck_len':      bottleneck_len,
+        'decoder_kernel_size': decoder_kernel,
+        'output_len':          fixed_len_L,
+        'sa_scale':            sa_scale_list,
+        'val_loss':            val_loss,
+        'val_rmse_deg':        val_rmse_list,
+        'channel_labels':      list(_WING_ANGLE_LABELS),
+    }, os.path.join(target_dir, 'best_autoencoder.pt'))
+
+    with open(os.path.join(target_dir, 'best_config.json'), 'w') as f:
+        json.dump(run_config, f, indent=2)
+
+    model = WingbeatAutoencoder(
+        latent_dim          = latent_dim,
+        activation          = activation,
+        dropout             = dropout,
+        base_channels       = base_channels,
+        bottleneck_len      = bottleneck_len,
+        decoder_kernel_size = decoder_kernel,
+        output_len          = fixed_len_L,
+    )
+    model.load_state_dict(ae_state)
+    model.to(device)
+
+    _plot_reconstructed_trajectory(
+        model     = model,
+        val_trajs = val_trajs,
+        template  = template,
+        save_path = os.path.join(target_dir, "reconstruction.png"),
+        device    = device,
+        seed      = seed,
+    )
+
+    if bucket_axes:
+        plot_per_phase_error(
+            model              = model,
+            npz_path           = fl_dataset_path,
+            val_trajectory_ids = set(int(i) for i in val_indices),
+            device             = device,
+            save_dir           = target_dir,
+        )
+        for axis in expand_score_axis(list(bucket_axes)):
+            evaluate_by_maneuver_bucket(
+                model              = model,
+                npz_path           = fl_dataset_path,
+                val_trajectory_ids = set(int(i) for i in val_indices),
+                score_axis         = axis,
+                device             = device,
+                save_dir           = target_dir,
+                template_path      = template_path,
+            )
+
+    print(f"  ✓ latent_dim={latent_dim} → {target_dir}  (val_loss={val_loss:.6f})", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Wingbeat Autoencoder Grid Search")
     parser.add_argument("--config", default="code/autoencoder_config.json", help="Path to JSON config file")
@@ -853,6 +976,10 @@ def main():
     best_decoder_state   = None
     best_autoencoder_state = None
     best_run_val_rmse_deg: np.ndarray | None = None
+    # Per-latent-dim best across the grid: each entry is the winning config among
+    # all grid combos that share that latent_dim. Persisted after the grid loop so
+    # downstream interpretability experiments can compare reconstructions across dims.
+    per_dim_best: dict[int, dict] = {}
 
     def _build_model(rcfg: dict) -> WingbeatAutoencoder:
         return WingbeatAutoencoder(
@@ -949,6 +1076,19 @@ def main():
             best_decoder_state     = copy.deepcopy(model.decoder.state_dict())
             best_autoencoder_state = copy.deepcopy(best_state)
             best_run_val_rmse_deg  = best_val_rmse_deg
+
+        # Track the best across all configs sharing this latent_dim — used after
+        # the grid completes to write one checkpoint per unique latent_dim value.
+        ld = int(run_config['latent_dim'])
+        prev = per_dim_best.get(ld)
+        if prev is None or run_best < prev['val_loss']:
+            per_dim_best[ld] = {
+                'val_loss':          run_best,
+                'run_config':        run_config,
+                'autoencoder_state': copy.deepcopy(best_state),
+                'decoder_state':     copy.deepcopy(model.decoder.state_dict()),
+                'val_rmse_deg':      best_val_rmse_deg,
+            }
 
     # --- Persist results ---
 
@@ -1073,6 +1213,33 @@ def main():
                 file_prefix        = "",
                 print_table        = True,
                 template_path      = fixed['template_path'],
+            )
+
+    # --- Per-latent-dim subdirectories (only when latent_dim was actually swept) ---
+    # For each unique latent_dim value, we already tracked the best-across-all-other-
+    # hyperparams config inside the grid loop. Write each into its own subdir with
+    # the full eval suite so they can be loaded and compared independently.
+    unique_dims = sorted(per_dim_best.keys())
+    if len(unique_dims) > 1:
+        print(f"\nSaving per-latent-dim winners ({len(unique_dims)} dims) under {save_dir}", flush=True)
+        for ld in unique_dims:
+            info = per_dim_best[ld]
+            _save_per_dim_artifacts(
+                target_dir       = os.path.join(save_dir, f"latent_dim_{ld}"),
+                run_config       = info['run_config'],
+                ae_state         = info['autoencoder_state'],
+                dec_state        = info['decoder_state'],
+                val_rmse_deg     = info['val_rmse_deg'],
+                val_loss         = info['val_loss'],
+                fixed_len_L      = fixed_len_L,
+                val_indices      = val_indices,
+                fl_dataset_path  = fl_dataset_path,
+                template         = template,
+                template_path    = fixed['template_path'],
+                val_trajs        = val_trajs,
+                seed             = seed,
+                device           = device,
+                bucket_axes      = bucket_axes,
             )
 
     print(f"\n{'=' * 45}")
