@@ -821,11 +821,14 @@ def _save_per_dim_artifacts(
     model.load_state_dict(ae_state)
     model.to(device)
 
+    eval_dir = os.path.join(target_dir, "eval")
+    os.makedirs(eval_dir, exist_ok=True)
+
     _plot_reconstructed_trajectory(
         model     = model,
         val_trajs = val_trajs,
         template  = template,
-        save_path = os.path.join(target_dir, "reconstruction.png"),
+        save_path = os.path.join(eval_dir, "reconstruction.png"),
         device    = device,
         seed      = seed,
     )
@@ -836,12 +839,12 @@ def _save_per_dim_artifacts(
             npz_path           = fl_dataset_path,
             val_trajectory_ids = set(int(i) for i in val_indices),
             device             = device,
-            save_dir           = target_dir,
+            save_dir           = eval_dir,
         )
         plot_phase_range_distributions(
             errors_deg   = per_phase["errors_deg"],
             phase_ranges = list(DEFAULT_PHASE_RANGES),
-            save_dir     = target_dir,
+            save_dir     = eval_dir,
         )
         for axis in expand_score_axis(list(bucket_axes)):
             evaluate_by_maneuver_bucket(
@@ -850,7 +853,7 @@ def _save_per_dim_artifacts(
                 val_trajectory_ids = set(int(i) for i in val_indices),
                 score_axis         = axis,
                 device             = device,
-                save_dir           = target_dir,
+                save_dir           = eval_dir,
                 template_path      = template_path,
             )
 
@@ -1230,6 +1233,8 @@ def main():
     # Output files have no run-label prefix so this matches the manual evaluator.
     bucket_axes = fixed.get('post_training_bucket_eval_axes', ['max'])
     if bucket_axes:
+        eval_dir = os.path.join(save_dir, "eval")
+        os.makedirs(eval_dir, exist_ok=True)
         # Per-phase error plot is independent of score_axis, so run it once.
         # We pass best_fl_dataset_path — the npz for the best model's L.
         per_phase = plot_per_phase_error(
@@ -1237,14 +1242,14 @@ def main():
             npz_path           = best_fl_dataset_path,
             val_trajectory_ids = set(int(i) for i in val_indices),
             device             = device,
-            save_dir           = save_dir,
+            save_dir           = eval_dir,
         )
         # Phase-window error histograms — driven by the same raw-error tensor
         # plot_per_phase_error already produced, so no extra model pass.
         plot_phase_range_distributions(
             errors_deg   = per_phase["errors_deg"],
             phase_ranges = list(DEFAULT_PHASE_RANGES),
-            save_dir     = save_dir,
+            save_dir     = eval_dir,
         )
         for axis in expand_score_axis(list(bucket_axes)):
             evaluate_by_maneuver_bucket(
@@ -1253,7 +1258,7 @@ def main():
                 val_trajectory_ids = set(int(i) for i in val_indices),
                 score_axis         = axis,
                 device             = device,
-                save_dir           = save_dir,
+                save_dir           = eval_dir,
                 file_prefix        = "",
                 print_table        = True,
                 template_path      = fixed['template_path'],

@@ -177,8 +177,9 @@ def main() -> None:
     )
 
     # --- Output directory ---
-    # Default to the model's own directory so plots live alongside the checkpoint they came from.
-    save_dir = args.save_dir if args.save_dir is not None else model_dir
+    # Default to <model_dir>/eval/ so plots live next to (not on top of) the checkpoint.
+    # An explicit --save_dir is taken as-is (no eval/ suffix added).
+    save_dir = args.save_dir if args.save_dir is not None else os.path.join(model_dir, "eval")
     os.makedirs(save_dir, exist_ok=True)
 
     # --- Per-maneuver-bucket eval (default on; --no_bucket_eval to skip) ---
