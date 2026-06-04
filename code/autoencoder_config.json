@@ -5,7 +5,7 @@
     "fixed_len": [30, 45, 69],
     "auto_build_dataset": true,
     "post_training_bucket_eval_axes": ["all"],
-    "random_seed": [42, 123, 456, 789, 101112, 131415],
+    "random_seed": [42, 123, 456, 789, 101112, 131415, 161718, 192021, 222324, 252627, 282930, 313233, 343536, 373839],
     "val_split": 0.15,
     "device": "auto",
     "n_epochs": 100,

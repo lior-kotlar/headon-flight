@@ -10,6 +10,7 @@ import itertools
 import json
 import os
 import sys
+import time
 from datetime import datetime
 
 import matplotlib
@@ -1046,6 +1047,9 @@ def main():
         best_state   = None
         was_stuck    = False
         best_val_rmse_deg: np.ndarray | None = None
+        # Wall clock for this config — covers every restart attempt so retried
+        # configs show their real cost. Stored on the summary entry below.
+        run_t0 = time.perf_counter()
         while True:
             # Re-seed before each attempt so initial inits are deterministic per (seed, attempt).
             sub_seed = run_seed if attempt == 0 else run_seed * 1000 + attempt
@@ -1090,11 +1094,19 @@ def main():
 
         attempts_used  = attempt + 1
         final_was_stuck = was_stuck  # True only if all attempts were exhausted while stuck
+        train_seconds   = time.perf_counter() - run_t0
 
         model.load_state_dict(best_state)
         run_best = min(val_losses) if val_losses else min(train_losses)
         rmse_msg = f"  {_format_rmse_degrees(best_val_rmse_deg)}" if best_val_rmse_deg is not None else ""
-        print(f"  Best val loss: {run_best:.6f}  (attempts={attempts_used}, final_stuck={final_was_stuck}){rmse_msg}")
+        h, rem = divmod(int(train_seconds), 3600)
+        m, s   = divmod(rem, 60)
+        train_time_hms = f"{h:d}:{m:02d}:{s:02d}"
+        print(
+            f"  Best val loss: {run_best:.6f}  "
+            f"(attempts={attempts_used}, final_stuck={final_was_stuck}, "
+            f"train_time={train_time_hms}){rmse_msg}"
+        )
 
         summary.append({
             **dict(zip(grid_keys, combo)),
@@ -1102,6 +1114,8 @@ def main():
             'best_val_rmse_deg':   None if best_val_rmse_deg is None else [float(v) for v in best_val_rmse_deg],
             'attempts':            attempts_used,
             'final_was_stuck':     final_was_stuck,
+            'train_seconds':       float(train_seconds),
+            'train_time_hms':      train_time_hms,
         })
 
         if run_best < best_val_loss:
