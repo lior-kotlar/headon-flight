@@ -1,0 +1,233 @@
+================================================================================
+GUIDE: Reading the outputs of evaluate_body_to_wingbeat.py
+================================================================================
+
+All files land in <regressor_run_dir>/eval/ when running either:
+    python code/evaluate_body_to_wingbeat.py --regressor_dir ... --autoencoder_dir ...
+or automatically at the end of body_latent_regressor.py training.
+
+Recommended reading order on a new run:
+    1. error_decomposition.png   — is the model good in physical units?
+    2. retrieval.png             — does it land on the right wingbeat?
+    3. per_dim_r2.png            — which latent dims does the model learn?
+    4. duration_scatter.png      — sanity check on the duration head.
+    5. reconstruction_examples.png — qualitative gut-check.
+    6. rmse_per_channel.png      — per-channel attribution if needed.
+
+
+--------------------------------------------------------------------------------
+1. retrieval.png — "is the regressor pointing at the right wingbeat?"
+--------------------------------------------------------------------------------
+
+Two-panel figure. The whole point: the latent MSE number tells you nothing on
+its own, but rank tells you how the prediction places among the population of
+real wingbeats.
+
+LEFT PANEL — rank histogram
+  For each val example, sort all N val wingbeats by L2 distance from the
+  prediction. Rank = position of the true wingbeat in that sorted list.
+    rank 0   = the predicted nearest neighbor IS the true wingbeat (perfect).
+    rank N-1 = the true wingbeat is the farthest thing from the prediction
+               (catastrophic).
+
+  Good:  a sharp spike near 0 that decays fast. Most wingbeats are correctly
+         identified or nearly so.
+  Bad:   a uniform distribution from 0 to N. Predictions are uncorrelated with
+         targets — no better than random.
+
+  Black dashed line: median rank (the headline number).
+  Corner box: top-K accuracies. "top1_acc = 0.40" means the prediction's
+              nearest neighbor was the true wingbeat 40% of the time.
+
+RIGHT PANEL — percentile histogram
+  Same data, normalized to [0, 1] (rank / (N-1)). Easier to compare across
+  runs with different val-set sizes.
+
+  Good:  mass concentrated near 0.
+  Bad:   flat from 0 to 1.
+
+  Median percentile of 0.5 = random retrieval. Anything close to 0 is great;
+  anything > 0.3 is worrying.
+
+
+--------------------------------------------------------------------------------
+2. rmse_per_channel.png — "how wrong is each wing angle, in degrees?"
+--------------------------------------------------------------------------------
+
+Grouped bars: one cluster per L/R wing-angle channel (L_phi, L_theta, L_psi,
+R_phi, R_theta, R_psi), with up to three colored bars per cluster:
+
+  "AE floor" (blue)
+    RMSE between decode(true_latent) and the actual ground-truth wingbeat.
+    This is the autoencoder's own reconstruction error.
+    THE REGRESSOR CANNOT BEAT THIS NUMBER. Even with a perfect prediction
+    of the latent, you'd only recover the AE's reconstruction.
+
+  "Regressor add" (orange)
+    RMSE between decode(pred_latent) and decode(true_latent). The error the
+    regressor adds on top of the AE floor, in physical degrees.
+    CONDITIONAL ON A PERFECT DECODER.
+
+  "End-to-end" (red)
+    RMSE between decode(pred_latent) and the ground-truth wingbeat.
+    The actual physical error a downstream consumer sees.
+
+How to read it:
+  - "End-to-end" barely taller than "AE floor"  →  the regressor is essentially
+    as good as the autoencoder allows. The bottleneck is the AE.
+  - "End-to-end" much taller than "AE floor"    →  the regressor has room to
+    grow.
+  - Channel-by-channel comparison shows whether the error is uniform or
+    concentrated in specific angles (phi vs theta vs psi, or L vs R).
+    Asymmetries between L and R are interesting — they suggest the model
+    handles one wing better than the other, which shouldn't happen with a
+    good model since the data is roughly symmetric.
+  - Numbers above bars are the raw values in degrees.
+
+If wingbeats_L<L>.npz wasn't found, you'll see only the orange "Regressor
+add" bars (AE floor and end-to-end require ground-truth wingbeats).
+
+
+--------------------------------------------------------------------------------
+3. error_decomposition.png — the headline three-bar summary
+--------------------------------------------------------------------------------
+
+Same three numbers as rmse_per_channel.png, but averaged across the 6
+channels and shown as a single chart.
+
+This is THE FIGURE to put on a slide. It answers in one glance: "is the
+system physically accurate, and is the bottleneck the AE or the regressor?"
+
+  AE floor       (blue):   irreducible AE reconstruction error.
+  Regressor add  (orange): what the regressor adds beyond that.
+  End-to-end     (red):    what you actually get in practice.
+
+Reading guide:
+  All three bars short and close together  →  both components are tight;
+                                              the system is good. Done.
+  AE floor large, regressor add small      →  bottleneck is the autoencoder;
+                                              train a better AE.
+  AE floor small, regressor add large      →  bottleneck is the regressor;
+                                              tune it or revisit features.
+  End-to-end << AE floor + regressor added →  the errors partially cancel
+                                              (rare but possible when biases
+                                              work against each other).
+
+
+--------------------------------------------------------------------------------
+4. per_dim_r2.png — which latent dimensions the regressor can predict
+--------------------------------------------------------------------------------
+
+One bar per latent dimension. For each dim k:
+    R^2_k = 1 − Var(pred_k − true_k) / Var(true_k)
+
+  R^2 = 1  (near the dotted reference line at top): perfect prediction.
+  R^2 = 0  (solid horizontal at zero): no better than always predicting the
+           val-set mean of that dimension.
+  R^2 < 0  (red bars below zero): WORSE than the trivial predictor. Likely
+           overfit on that dim, or that dim is genuinely noise from the body
+           kinematics' perspective.
+
+What to look for:
+  A few dims at R^2 ≈ 1, others at R^2 ≈ 0 is informative — it tells you the
+  latent space has structure the body kinematics can resolve along some axes
+  but not others. Combined with the AE's inspect_latent_space.py variance
+  analysis, this lets you identify which latent directions correspond to
+  body-determined wing motion vs. wing-specific structure that body
+  kinematics can't see.
+
+  All dims uniformly low  →  body input is fundamentally not informative
+                             enough; collecting more body channels or a
+                             different scaling won't help. Different feature
+                             representation needed.
+
+  A handful of red bars   →  those dims may be near-zero-variance in val
+                             (denominator small, ratio noisy); harmless.
+                             Worry only if many dims go negative.
+
+X-axis is just the latent index, no semantic meaning — but if you're
+comparing across regressor runs against the same AE, the indices are
+consistent.
+
+
+--------------------------------------------------------------------------------
+5. duration_scatter.png — does the regressor get the wingbeat length right?
+--------------------------------------------------------------------------------
+
+X = true duration in samples, Y = predicted duration in samples. One dot per
+val wingbeat. Diagonal y = x reference line in black.
+
+  Good:  dots cluster tightly along the diagonal.
+  Bad:   dots scattered widely, or systematically off the diagonal (regressor
+         over- or under-predicts duration consistently).
+
+  Common pathology — horizontal band: the regressor is predicting roughly
+  the mean duration regardless of input, which means it's barely using the
+  body kinematics for duration at all. If you see this AND the duration MAE
+  is close to the predict-the-mean baseline from _print_diagnostics, lean
+  toward dropping the duration head or increasing its loss weight.
+
+The console also prints MAE in samples and MAPE %, which are the headline
+numbers.
+
+
+--------------------------------------------------------------------------------
+6. reconstruction_examples.png — qualitative spot-check
+--------------------------------------------------------------------------------
+
+A grid of small panels. Rows are random val wingbeats, columns are the three
+angles phi / theta / psi. Each panel has six traces:
+
+  Style    Color       What it is
+  -----    -----       -----------
+  Solid    Blue        Truth, left wing
+  Solid    Red         Truth, right wing
+  Dashed   Blue/Red    decode(true_latent) — what the AE reconstructs from
+                       the actual encoded wingbeat (AE-only reconstruction)
+  Dotted   Blue/Red    decode(pred_latent) — what the body→latent regressor
+                       + decoder produces from body kinematics alone
+                       (end-to-end output)
+
+Reading guide:
+  Solid vs dashed gap  = AE error.
+                         Small gap means the AE faithfully encodes this
+                         wingbeat.
+  Dashed vs dotted gap = regressor error.
+                         Small gap means the regressor's predicted latent
+                         is close to the true latent in decoder output space.
+  Solid vs dotted gap  = end-to-end error.
+                         This is what downstream sees.
+
+Hunt for patterns:
+  - regressor consistently misses a peak amplitude  →  underestimated
+                                                       principal component
+  - lag or lead in phase  →  duration prediction is off but morphology is OK
+  - high-frequency noise cleaned up  →  latent space is smoothing
+                                        (usually fine)
+
+Pick --seed carefully. Default is 0 so the figure is reproducible across
+runs. Re-running with different seeds is a cheap way to sanity-check that
+the "good" examples aren't cherry-picked by chance.
+
+
+--------------------------------------------------------------------------------
+7. evaluation.json — machine-readable sidecar
+--------------------------------------------------------------------------------
+
+All of the numbers above in one file:
+
+  retrieval              median rank, median percentile, mean rank/percentile,
+                         top-K accuracies.
+  rmse_deg_per_channel   per-channel arrays for AE floor / regressor added /
+                         end-to-end.
+  rmse_deg_mean          the same three numbers averaged across channels
+                         (these are what end up in error_decomposition.png).
+  per_dim_r2             the R^2 array.
+  duration               MAE in samples, MAPE %, true min/max range.
+  n_val, latent_dim, evaluated_at, plus pointers to the checkpoints and
+  dataset used.
+
+Useful for:
+  - scripting comparison plots across multiple regressor runs (the same way
+    plot_fixed_len_vs_performance.py reads the AE's grid_search_summary.json)
+  - paper tables.

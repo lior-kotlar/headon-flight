@@ -527,6 +527,21 @@ def main():
     print(f"Done. Best val_loss={best_overall_loss:.5f}")
     print(f"Saved → {save_dir}")
 
+    # --- Auto-trigger end-to-end evaluation on the overall-best checkpoint.
+    # Same suite as `python code/evaluate_body_to_wingbeat.py`. Wrapped in
+    # try/except so a plotting hiccup doesn't tank a multi-hour training run.
+    try:
+        from evaluate_body_to_wingbeat import run_evaluation
+        print("\n--- Running post-training evaluation ---", flush=True)
+        run_evaluation(
+            regressor_dir   = save_dir,
+            autoencoder_dir = best_overall_extras["autoencoder_model_dir"],
+            dataset_path    = fixed["dataset_path"],
+            device          = device,
+        )
+    except Exception as exc:
+        print(f"  Skipping post-training evaluation: {exc}", flush=True)
+
 
 if __name__ == "__main__":
     main()

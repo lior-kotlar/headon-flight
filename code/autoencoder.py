@@ -47,6 +47,7 @@ from data_handling.bucket_eval import (
     DEFAULT_PHASE_RANGES,
 )
 from data_handling.maneuver_scoring import expand_score_axis
+from plot_fixed_len_vs_performance import plot_fixed_len_vs_performance
 
 # Architecture constants
 _BASE_CHANNELS  = 128  # default channels at the deepest conv layer; overridable per model
@@ -1322,6 +1323,19 @@ def main():
                 device           = device,
                 bucket_axes      = bucket_axes,
             )
+
+    # --- Cross-run summary: fixed_len vs performance.
+    # Only meaningful when more than one fixed_len was actually swept; otherwise
+    # the strip plot would be a single column with no comparison to make.
+    if L_swept:
+        try:
+            plot_fixed_len_vs_performance(
+                summary_entries = summary,
+                out_path        = os.path.join(save_dir, "fixed_len_vs_rmse_deg.png"),
+                metric          = "rmse_deg",
+            )
+        except Exception as exc:
+            print(f"  Skipping fixed_len-vs-performance plot: {exc}", flush=True)
 
     print(f"\n{'=' * 45}")
     print(f"Grid search complete.")
