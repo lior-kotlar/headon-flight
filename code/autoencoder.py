@@ -9,6 +9,7 @@ import copy
 import itertools
 import json
 import os
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -741,6 +742,7 @@ def _save_per_dim_artifacts(
     val_loss: float,
     fixed_len_L: int,
     val_indices: list,
+    val_indices_src_path: str,
     fl_dataset_path: str,
     template: np.ndarray,
     template_path: str,
@@ -810,6 +812,14 @@ def _save_per_dim_artifacts(
 
     with open(os.path.join(target_dir, 'best_config.json'), 'w') as f:
         json.dump(run_config, f, indent=2)
+
+    # Copy the run's shared val_indices.json (written once at the sweep root) into
+    # this subdir, so each per-combo model dir is self-contained: downstream tools
+    # (build_regressor_dataset, body_latent_regressor, evaluate_body_to_wingbeat)
+    # all expect val_indices.json next to best_autoencoder.pt. Copying the root
+    # file verbatim guarantees the per-dim split can't silently diverge from it.
+    if os.path.exists(val_indices_src_path):
+        shutil.copy(val_indices_src_path, os.path.join(target_dir, 'val_indices.json'))
 
     model = WingbeatAutoencoder(
         latent_dim          = latent_dim,
@@ -1315,6 +1325,7 @@ def main():
                 val_loss         = info['val_loss'],
                 fixed_len_L      = L_val,
                 val_indices      = val_indices,
+                val_indices_src_path = os.path.join(save_dir, 'val_indices.json'),
                 fl_dataset_path  = info['fl_dataset_path'],
                 template         = template,
                 template_path    = fixed['template_path'],

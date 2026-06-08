@@ -602,32 +602,47 @@ def run_evaluation(
                           os.path.join(save_dir, "duration_scatter.png"))
 
     # --- 5. Error-floor decomposition ---
-    # AE floor + end-to-end need ground-truth SA wingbeats at length L, which
-    # live in wingbeats_L<L>.npz. Derive its path from the AE config.
+    # AE floor + end-to-end need the ground-truth SA wingbeat for each val latent.
+    # Preferred source: the `sa_wingbeats` array stored in the regressor dataset,
+    # which is the exact (6, L) normalized SA that was encoded into each latent —
+    # aligned 1:1, no positional re-derivation. Fall back to aligning against
+    # wingbeats_L<L>.npz only for legacy datasets without it (this fallback is
+    # fragile: the npz's filtering differs and can silently misalign rows).
     floor_per_channel = None
     e2e_per_channel   = None
     sa_true_aligned   = None
-    ae_config_path    = os.path.join(a_dir, "best_config.json")
-    if npz_path is None and os.path.exists(ae_config_path):
-        with open(ae_config_path) as f:
-            ae_config = json.load(f)
-        L = int(bw.decoder.output_len)
-        data_dir = os.path.dirname(os.path.abspath(ae_config["data_path"]))
-        npz_path = os.path.join(data_dir, f"wingbeats_L{L}.npz")
 
-    if npz_path and os.path.exists(npz_path):
-        print(f"\nAligning val ground truth from {npz_path} ...")
-        sa_true_aligned, _ = _align_val_sa_to_regressor(npz_path, splits)
+    if "sa_wingbeats" in splits:
+        sa_true_aligned = splits["sa_wingbeats"][splits["val_idx"]]
+        gt_source = f"{dataset_path} (stored sa_wingbeats)"
+    else:
+        ae_config_path = os.path.join(a_dir, "best_config.json")
+        if npz_path is None and os.path.exists(ae_config_path):
+            with open(ae_config_path) as f:
+                ae_config = json.load(f)
+            L = int(bw.decoder.output_len)
+            data_dir = os.path.dirname(os.path.abspath(ae_config["data_path"]))
+            npz_path = os.path.join(data_dir, f"wingbeats_L{L}.npz")
+        if npz_path and os.path.exists(npz_path):
+            print(f"\nNo stored sa_wingbeats in dataset — aligning val ground truth "
+                  f"by position from {npz_path} (legacy path; rebuild the dataset to fix).")
+            sa_true_aligned, _ = _align_val_sa_to_regressor(npz_path, splits)
+            gt_source = npz_path
+        else:
+            gt_source = None
+
+    if sa_true_aligned is not None:
         sa_true_t = torch.from_numpy(sa_true_aligned).to(device)
         floor_per_channel = decoded_rmse_deg(decoded_true, sa_true_t)
         e2e_per_channel   = decoded_rmse_deg(decoded_pred, sa_true_t)
-        print("=== Error-floor decomposition (RMSE in degrees, averaged over 6 channels) ===")
+        print(f"\n=== Error-floor decomposition (RMSE in degrees, averaged over 6 channels) ===")
+        print(f"  Ground truth: {gt_source}")
         print(f"  AE floor     = {float(np.mean(floor_per_channel)):.3f}°")
         print(f"  Regressor +  = {added_mean:.3f}°")
         print(f"  End-to-end   = {float(np.mean(e2e_per_channel)):.3f}°")
     else:
-        print(f"\nSkipping AE-floor / end-to-end: no wingbeats_L<L>.npz found "
-              f"({npz_path!r}). The regressor's added error is still computed above.")
+        print(f"\nSkipping AE-floor / end-to-end: no stored sa_wingbeats and no "
+              f"wingbeats_L<L>.npz found. The regressor's added error is still computed above.")
 
     # --- Bar charts (per-channel + summary) ---
     rmse_groups: dict[str, np.ndarray] = {"Regressor add": added_per_channel}
@@ -664,6 +679,7 @@ def run_evaluation(
         "regressor_dir":    r_dir,
         "autoencoder_dir":  a_dir,
         "dataset_path":     dataset_path,
+        "ground_truth_source": gt_source,
         "wingbeats_npz":    npz_path if npz_path and os.path.exists(npz_path) else None,
         "n_val":            int(n_val),
         "latent_dim":       int(pred_latents.shape[1]),

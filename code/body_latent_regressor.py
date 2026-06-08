@@ -99,7 +99,7 @@ def _load_split(dataset_path: str, ae_val_indices_path: str) -> dict:
     val_trajs = set(int(i) for i in meta["val_indices"])
     val_mask = np.array([int(t) in val_trajs for t in traj_ids], dtype=bool)
 
-    return {
+    split = {
         "body_means":      body_means,
         "next_body_means": next_body_means,
         "target_latents":  target_latents,
@@ -108,6 +108,12 @@ def _load_split(dataset_path: str, ae_val_indices_path: str) -> dict:
         "train_idx":       np.where(~val_mask)[0],
         "val_idx":         np.where( val_mask)[0],
     }
+    # The exact (6, L) normalized SA fed to the encoder, when the dataset was
+    # built with it. Lets the evaluator use ground truth aligned 1:1 to each
+    # latent instead of re-deriving it by position from wingbeats_L<L>.npz.
+    if "sa_wingbeats" in data.files:
+        split["sa_wingbeats"] = data["sa_wingbeats"].astype(np.float32)
+    return split
 
 
 def _fit_standardizer(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -238,6 +244,75 @@ def _resolve_ae_model_dir(model_dir: str) -> str:
     latest = os.path.join(model_dir, candidates[-1])
     print(f"No val_indices.json directly in {model_dir} — using latest: {latest}")
     return latest
+
+
+def _read_ae_dims(ae_model_dir: str) -> tuple[int, int]:
+    """The (latent_dim, output_len) the autoencoder at ae_model_dir produces — these
+    fix the regressor dataset's target shape and wingbeat length. Read from
+    best_config.json (cheap); fall back to the checkpoint if a key is absent."""
+    latent_dim = L = None
+    cfg_path = os.path.join(ae_model_dir, "best_config.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            c = json.load(f)
+        latent_dim = c.get("latent_dim")
+        L          = c.get("fixed_len", c.get("output_len"))
+    if latent_dim is None or L is None:
+        ckpt = torch.load(os.path.join(ae_model_dir, "best_autoencoder.pt"),
+                          map_location="cpu", weights_only=False)
+        latent_dim = ckpt["latent_dim"]
+        L          = ckpt["output_len"]
+    return int(latent_dim), int(L)
+
+
+def _resolve_dataset_path(fixed: dict, ae_model_dir: str, device: str) -> str:
+    """Return the regressor dataset path for this autoencoder, building it if needed.
+
+    An explicit fixed["dataset_path"] is honored as-is (trust the user's file).
+    Otherwise the path is derived from the AE's (latent_dim, L) under fixed["data_dir"];
+    if missing or built against a different AE it is rebuilt in-process (when
+    auto_build_dataset is true), mirroring autoencoder.py's auto_build_dataset flow.
+    """
+    explicit = fixed.get("dataset_path")
+    if explicit:
+        if not os.path.exists(explicit):
+            raise FileNotFoundError(f"Configured dataset_path {explicit} not found.")
+        return explicit
+
+    from data_handling.build_regressor_dataset import (
+        build_regressor_dataset,
+        regressor_dataset_path,
+        regressor_dataset_sidecar_path,
+        regressor_dataset_is_valid,
+    )
+
+    latent_dim, L = _read_ae_dims(ae_model_dir)
+    data_dir = fixed.get("data_dir", "data")
+    path     = regressor_dataset_path(data_dir, latent_dim, L)
+    sidecar  = regressor_dataset_sidecar_path(data_dir, latent_dim, L)
+    is_valid, reason = regressor_dataset_is_valid(
+        path, sidecar, latent_dim=latent_dim, L=L, autoencoder_model_dir=ae_model_dir,
+    )
+    if is_valid:
+        print(f"Regressor dataset: {path}  (latent_dim={latent_dim}, L={L})")
+        return path
+
+    if not bool(fixed.get("auto_build_dataset", True)):
+        raise FileNotFoundError(
+            f"Regressor dataset unusable ({reason}). Set auto_build_dataset=true, or run:\n"
+            f"  python code/data_handling/build_regressor_dataset.py "
+            f"--model_dir {ae_model_dir} --output {path}"
+        )
+
+    print(f"Regressor dataset unusable ({reason}) — building from {ae_model_dir} ...", flush=True)
+    build_regressor_dataset(
+        model_dir              = ae_model_dir,
+        output                 = path,
+        template_path          = fixed.get("template_path", "data/analysis/golden_template.npy"),
+        asymmetry_max_multiple = float(fixed.get("asymmetry_max_multiple", 10.0)),
+        device                 = device,
+    )
+    return path
 
 
 def train_one(
@@ -468,6 +543,9 @@ def main():
     # so this only needs to run once before the loop ---
     ae_model_dir_diag = _resolve_ae_model_dir(fixed["autoencoder_model_dir"])
     val_indices_path  = os.path.join(ae_model_dir_diag, "val_indices.json")
+    # Resolve (and auto-build if needed) the dataset matching this AE's (latent_dim, L),
+    # then pin it into `fixed` so train_one and the post-training eval all use it.
+    fixed["dataset_path"] = _resolve_dataset_path(fixed, ae_model_dir_diag, device)
     splits_for_diag   = _load_split(fixed["dataset_path"], val_indices_path)
     _print_diagnostics(splits_for_diag, fixed["dataset_path"], ae_model_dir_diag)
 
