@@ -30,6 +30,25 @@ Available analyses:
                         the val set, with z_mean marked. Useful for spotting
                         bimodal or skewed dims.
 
+  pca                   Raw-covariance PCA over the encoded wingbeats. Finds the
+                        orthogonal directions of greatest variation in latent
+                        space (the raw dims usually aren't those directions).
+                        Writes a scree / explained-variance plot, a JSON of the
+                        components, and — like traversal but along each principal
+                        component — one PNG per PC sweeping z_mean ± range_std·σ
+                        along that PC and decoding, so you see what coordinated
+                        change in wingbeat shape each component controls.
+
+  pca_3d                Interactive 3D scatter (Plotly HTML) of every encoded
+                        wingbeat projected onto the top-3 principal components.
+                        Writes one scatter per body angular-accel axis (yaw,
+                        pitch, roll), each point colored on a continuous gradient
+                        by the magnitude of that axis' acceleration
+                        (|body_means[:, 9/10/11]|). Shows whether high-maneuver
+                        wingbeats occupy a distinct region of latent space. The
+                        color scale is clipped at --color_clip_pct (default p99)
+                        because the angular accel is heavy-tailed.
+
   template_vs_mean      Probes encoder nonlinearity by comparing three
                         reference latents against the empirical distribution
                         of encoded val wingbeats:
@@ -85,6 +104,8 @@ _ANALYSIS_CHOICES = (
     "distribution_sampling",
     "histograms",
     "template_vs_mean",
+    "pca",
+    "pca_3d",
     "all",
 )
 
@@ -503,6 +524,283 @@ def run_histograms(out_dir: str, lat_prefix: str, z_all: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
+# Analysis: PCA (raw-covariance principal components of the latent space)
+# ---------------------------------------------------------------------------
+
+
+def _compute_pca(z_all: torch.Tensor, z_mean: torch.Tensor) -> dict:
+    """
+    Raw-covariance PCA over the encoded wingbeats: center on z_mean (no per-dim
+    scaling) and SVD the centered matrix. Returns unit components, the std of the
+    data along each component (sqrt of the eigenvalue), and explained-variance.
+    """
+    z_all_np  = z_all.detach().cpu().numpy().astype(np.float64)                  # (N, D)
+    z_mean_np = z_mean.detach().cpu().numpy().astype(np.float64)                 # (D,)
+    n         = z_all_np.shape[0]
+    zc        = z_all_np - z_mean_np
+    # full_matrices=False → vt is (min(N,D), D); for N >> D this is (D, D).
+    _, s, vt = np.linalg.svd(zc, full_matrices=False)
+    eigvals      = (s ** 2) / max(n - 1, 1)                                       # variance along each PC
+    sigma_pc     = np.sqrt(eigvals)                                              # std along each PC
+    total        = float(eigvals.sum()) if eigvals.sum() > 0 else 1.0
+    expl_ratio   = eigvals / total
+    return {
+        "components":      vt,                          # (n_pc, D), each row a unit PC
+        "sigma_pc":        sigma_pc,                    # (n_pc,)
+        "explained_var":   eigvals,                     # (n_pc,)
+        "explained_ratio": expl_ratio,                  # (n_pc,)
+        "cumulative":      np.cumsum(expl_ratio),       # (n_pc,)
+        "n_wingbeats":     int(n),
+    }
+
+
+def _plot_pca_scree(pca: dict, out_path: str) -> None:
+    ratio = pca["explained_ratio"]
+    cum   = pca["cumulative"]
+    n_pc  = len(ratio)
+    fig, ax = plt.subplots(figsize=(max(6.0, n_pc * 0.6), 4.2))
+    ax.bar(range(n_pc), ratio, color="tab:green", alpha=0.8, label="per-PC")
+    ax.set_xticks(range(n_pc))
+    ax.set_xticklabels([f"PC{k}" for k in range(n_pc)], fontsize=9)
+    ax.set_ylabel("explained variance ratio")
+    ax.set_xlabel("Principal component")
+    ax.grid(True, axis="y", alpha=0.4)
+    ax2 = ax.twinx()
+    ax2.plot(range(n_pc), cum, color="tab:red", marker="o", lw=1.6, label="cumulative")
+    ax2.set_ylabel("cumulative explained variance", color="tab:red")
+    ax2.set_ylim(0.0, 1.02)
+    ax2.tick_params(axis="y", labelcolor="tab:red")
+    ax.set_title(
+        f"Latent PCA scree — raw covariance over {pca['n_wingbeats']} wingbeats "
+        f"({n_pc} components)"
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_pca_traversal_for_pc(
+    k:           int,
+    pca:         dict,
+    z_mean:      torch.Tensor,
+    model:       WingbeatAutoencoder,
+    template_L:  np.ndarray,
+    n_steps:     int,
+    range_std:   float,
+    device:      str,
+    out_path:    str,
+) -> None:
+    """
+    Sweep z_mean ± range_std·σ along principal component k (every other direction
+    held at z_mean), decode each step, and plot the wing-angle morph. Mirrors
+    _plot_traversal_for_dim but moves along a PC direction instead of a raw dim.
+    """
+    component = torch.from_numpy(pca["components"][k]).to(device=device, dtype=z_mean.dtype)
+    sigma_k   = float(pca["sigma_pc"][k])
+    deltas    = torch.linspace(-range_std, range_std, n_steps).to(device)
+    z_sweep   = z_mean.unsqueeze(0).repeat(n_steps, 1).clone()
+    z_sweep  += (deltas * sigma_k).unsqueeze(1) * component.unsqueeze(0)
+    with torch.no_grad():
+        recon_sa = model.decode(z_sweep).cpu().numpy()                          # (n_steps, 6, L)
+
+    L            = template_L.shape[0]
+    phase        = np.linspace(0.0, 1.0, L)
+    template_deg = np.rad2deg(template_L)
+    colors       = plt.get_cmap("coolwarm")(np.linspace(0.0, 1.0, n_steps))
+    mid_idx      = n_steps // 2
+
+    fig, axes = plt.subplots(3, 2, figsize=(11.5, 8.5), sharex=True)
+    fig.suptitle(
+        f"Latent PCA traversal — PC {k}   "
+        f"(σ={sigma_k:.3f}, explained var={100 * pca['explained_ratio'][k]:.1f}%)   "
+        f"±{range_std:.1f}σ, {n_steps} steps",
+        fontsize=13,
+    )
+    wing_labels = ["Left wing", "Right wing"]
+    for col_wing in (0, 1):
+        for row, (angle_label, L_col, R_col) in enumerate(_ANGLES):
+            ax       = axes[row, col_wing]
+            use_col  = L_col if col_wing == 0 else R_col
+            ax.plot(phase, template_deg[:, use_col],
+                    color="0.5", linestyle="--", lw=1.2, alpha=0.7, label="Template")
+            for step_idx in range(n_steps):
+                wing_angles = _reconstruct_wing_angles_from_normalized_sa(
+                    recon_sa[step_idx], template_L)
+                lw = 2.2 if step_idx == mid_idx else 1.3
+                ax.plot(phase, np.rad2deg(wing_angles[:, use_col]),
+                        color=colors[step_idx], lw=lw)
+            ax.grid(True, alpha=0.4)
+            if row == 0:
+                ax.set_title(wing_labels[col_wing], fontsize=11)
+            if col_wing == 0:
+                ax.set_ylabel(angle_label, fontsize=10)
+            if row == 2:
+                ax.set_xlabel("Normalized phase")
+
+    sm = plt.cm.ScalarMappable(
+        cmap="coolwarm", norm=plt.Normalize(vmin=-range_std, vmax=range_std)
+    )
+    sm.set_array([])
+    fig.colorbar(sm, ax=axes, fraction=0.025, pad=0.04, label=f"PC[{k}] offset (σ)")
+
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_pca(
+    out_dir:    str,
+    lat_prefix: str,
+    model:      WingbeatAutoencoder,
+    template_L: np.ndarray,
+    z_all:      torch.Tensor,
+    z_mean:     torch.Tensor,
+    latent_dim: int,
+    n_steps:    int,
+    range_std:  float,
+    device:     str,
+) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    pca = _compute_pca(z_all, z_mean)
+    n_pc = len(pca["sigma_pc"])
+
+    scree_path = os.path.join(out_dir, f"{lat_prefix}pca_scree.png")
+    _plot_pca_scree(pca, scree_path)
+    print(f"  → wrote {scree_path}", flush=True)
+
+    json_path = os.path.join(out_dir, f"{lat_prefix}pca.json")
+    with open(json_path, "w") as f:
+        json.dump({
+            "n_wingbeats":                   pca["n_wingbeats"],
+            "latent_dim":                    latent_dim,
+            "z_mean":                        [float(v) for v in z_mean.cpu()],
+            "components":                    [[float(v) for v in row] for row in pca["components"]],
+            "sigma_pc":                      [float(v) for v in pca["sigma_pc"]],
+            "explained_variance":            [float(v) for v in pca["explained_var"]],
+            "explained_variance_ratio":      [float(v) for v in pca["explained_ratio"]],
+            "cumulative_explained_variance": [float(v) for v in pca["cumulative"]],
+        }, f, indent=2)
+    print(f"  → wrote {json_path}", flush=True)
+
+    for k in range(n_pc):
+        out_path = os.path.join(out_dir, f"{lat_prefix}pc_{k:03d}.png")
+        _plot_pca_traversal_for_pc(
+            k=k, pca=pca, z_mean=z_mean, model=model, template_L=template_L,
+            n_steps=n_steps, range_std=range_std, device=device, out_path=out_path,
+        )
+        print(f"  → wrote {out_path}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Analysis: pca_3d (3D scatter on top-3 PCs, colored by pitch-accel magnitude)
+# ---------------------------------------------------------------------------
+
+# Body-kinematics columns for angular acceleration. Body means are laid out
+# [v(3), a(3), ω(3), α(3)]; the angular-accel block is cols 9-11 ordered
+# (yaw, pitch, roll) — see transform_data._BODY_ALPHA_COLS and
+# maneuver_scoring.CHANNEL_LABELS. One 3D scatter is drawn per axis.
+_ANGULAR_ACCEL_AXES = [
+    ("yaw",   9),
+    ("pitch", 10),
+    ("roll",  11),
+]
+
+
+def _plot_pca_scatter_3d_plotly(
+    coords:         np.ndarray,    # (N, 3) projection onto top-3 PCs
+    color_scalar:   np.ndarray,    # (N,) |angular accel| for the chosen axis
+    axis_name:      str,           # "yaw" | "pitch" | "roll"
+    expl_ratio:     np.ndarray,    # (>=3,) explained-variance ratio per PC
+    color_clip_pct: float,
+    n_wingbeats:    int,
+    out_path:       str,
+) -> None:
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        print("plotly not installed — skipping interactive 3D PCA scatter.", flush=True)
+        return
+
+    cmax = float(np.percentile(color_scalar, color_clip_pct))
+    fig = go.Figure(
+        data=go.Scatter3d(
+            x=coords[:, 0], y=coords[:, 1], z=coords[:, 2],
+            mode="markers",
+            marker=dict(
+                size=3,
+                color=color_scalar,
+                colorscale="Viridis",
+                cmin=0.0,
+                cmax=cmax,
+                opacity=0.6,
+                showscale=True,
+                colorbar=dict(title=f"‖{axis_name} angular accel‖"),
+            ),
+            hovertemplate=(
+                "PC0=%{x:.3f}<br>PC1=%{y:.3f}<br>PC2=%{z:.3f}"
+                f"<br>|{axis_name} α|=%{{marker.color:.3g}}<extra></extra>"
+            ),
+        )
+    )
+    fig.update_layout(
+        title=(
+            f"Latent PCA 3D scatter — {n_wingbeats} wingbeats, "
+            f"colored by |{axis_name} angular accel| (color clipped at p{color_clip_pct:g})"
+        ),
+        scene=dict(
+            xaxis_title=f"PC0 ({100 * expl_ratio[0]:.1f}% var)",
+            yaxis_title=f"PC1 ({100 * expl_ratio[1]:.1f}% var)",
+            zaxis_title=f"PC2 ({100 * expl_ratio[2]:.1f}% var)",
+        ),
+        width=1100, height=900,
+        template="plotly_white",
+    )
+    fig.write_html(out_path, include_plotlyjs="cdn")
+
+
+def run_pca_3d(
+    out_dir:        str,
+    lat_prefix:     str,
+    z_all:          torch.Tensor,
+    z_mean:         torch.Tensor,
+    latent_dim:     int,
+    npz_path:       str,
+    color_clip_pct: float,
+) -> None:
+    if latent_dim < 3:
+        print(f"  latent_dim={latent_dim} < 3 — cannot draw a 3D PCA scatter; skipping.", flush=True)
+        return
+
+    d = np.load(npz_path)
+    if "body_means" not in d.files:
+        print(f"  {npz_path} has no 'body_means' array — cannot color by angular accel; skipping.",
+              flush=True)
+        return
+    body_means = d["body_means"]                                                # (N, 12)
+    if body_means.shape[0] != z_all.shape[0]:
+        print(f"  body_means rows ({body_means.shape[0]}) ≠ encoded wingbeats "
+              f"({z_all.shape[0]}) — refusing to plot a misaligned scatter; skipping.", flush=True)
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+    pca = _compute_pca(z_all, z_mean)
+    z_all_np  = z_all.detach().cpu().numpy().astype(np.float64)
+    z_mean_np = z_mean.detach().cpu().numpy().astype(np.float64)
+    coords = (z_all_np - z_mean_np) @ pca["components"][:3].T                    # (N, 3)
+
+    # One scatter per angular-accel axis (yaw, pitch, roll). The PCA projection
+    # (coords) is shared; only the per-point color scalar changes.
+    for axis_name, col in _ANGULAR_ACCEL_AXES:
+        color_scalar = np.abs(body_means[:, col]).astype(np.float64)            # (N,)
+        out_path = os.path.join(out_dir, f"{lat_prefix}pca_scatter_3d_{axis_name}.html")
+        _plot_pca_scatter_3d_plotly(
+            coords=coords, color_scalar=color_scalar, axis_name=axis_name,
+            expl_ratio=pca["explained_ratio"], color_clip_pct=color_clip_pct,
+            n_wingbeats=pca["n_wingbeats"], out_path=out_path,
+        )
+        print(f"  → wrote {out_path}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Analysis: template vs mean
 # ---------------------------------------------------------------------------
 
@@ -810,6 +1108,10 @@ def main() -> None:
                         help="distribution_sampling: how many empirical-z[:,k] samples per dim (default: 100).")
     parser.add_argument("--sampling_seed", type=int, default=0,
                         help="distribution_sampling: RNG seed for reproducible bootstrap (default: 0).")
+    # pca_3d-specific
+    parser.add_argument("--color_clip_pct", type=float, default=99.0,
+                        help="pca_3d: clip the pitch-accel color scale at this percentile "
+                             "so the heavy tail doesn't wash out the gradient (default: 99).")
     args = parser.parse_args()
 
     device = args.device
@@ -844,6 +1146,27 @@ def main() -> None:
             latent_dim=ctx["latent_dim"], output_len=ctx["output_len"],
             npz_path=ctx["npz_path"], n_val=ctx["n_val"],
             model_dir=args.model_dir, device=device,
+        )
+
+    if "pca" in requested:
+        print("\n[pca]", flush=True)
+        run_pca(
+            out_dir=os.path.join(out_root, "pca"),
+            lat_prefix=ctx["lat_prefix"],
+            model=ctx["model"], template_L=ctx["template_L"],
+            z_all=ctx["z_all"], z_mean=ctx["z_mean"],
+            latent_dim=ctx["latent_dim"],
+            n_steps=args.n_steps, range_std=args.range_std, device=device,
+        )
+
+    if "pca_3d" in requested:
+        print("\n[pca_3d]", flush=True)
+        run_pca_3d(
+            out_dir=os.path.join(out_root, "pca_3d"),
+            lat_prefix=ctx["lat_prefix"],
+            z_all=ctx["z_all"], z_mean=ctx["z_mean"],
+            latent_dim=ctx["latent_dim"],
+            npz_path=ctx["npz_path"], color_clip_pct=args.color_clip_pct,
         )
 
     if "traversal" in requested:
