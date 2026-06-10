@@ -134,17 +134,17 @@ def decoded_rmse_deg(
     decoded_ref:  torch.Tensor,
 ) -> np.ndarray:
     """
-    Per-channel RMSE in degrees between two (B, 6, L) SA tensors. Converts both
-    to L/R-residual space (so channels match WING_ANGLE_LABELS), takes the
-    per-channel MSE, then scales to degrees via WING_ANGLE_SCALE.
+    Per-channel RMSE in degrees between two (B, 6, L) tensors ALREADY in the
+    per-angle-normalized L/R-residual space [L_phi..R_psi] (channels match
+    WING_ANGLE_LABELS). Takes the per-channel MSE, scales to degrees via
+    WING_ANGLE_SCALE. Both representations are decoded into this space upstream
+    (see _decode_lr), so the metric is identical and directly comparable.
     """
     if decoded_pred.shape != decoded_ref.shape:
         raise ValueError(
             f"shape mismatch: pred={tuple(decoded_pred.shape)} ref={tuple(decoded_ref.shape)}"
         )
-    pred_lr = sa_to_lr_norm(decoded_pred)
-    ref_lr  = sa_to_lr_norm(decoded_ref)
-    sq = (pred_lr - ref_lr).double() ** 2
+    sq = (decoded_pred - decoded_ref).double() ** 2
     mse_per_channel = sq.mean(dim=(0, 2)).cpu().numpy()                       # (6,)
     return channel_rmse_to_degrees(mse_per_channel)
 
@@ -278,15 +278,17 @@ def _predict_val(
     }
 
 
-def _decode(bw: BodyToWingbeat, latents: np.ndarray, device: str,
-            batch_size: int = 512) -> torch.Tensor:
-    """Decode (N, D) latents → (N, 6, L) SA wingbeats (kept on `device`)."""
+def _decode_lr(bw: BodyToWingbeat, latents: np.ndarray, device: str,
+               batch_size: int = 512) -> torch.Tensor:
+    """Decode latents → (N, 6, L) in per-angle-normalized L/R-residual space, kept on
+    `device`. Works for both representations: 'sa' latents are (N, D) and 'single_wing'
+    latents are (N, 2, D); bw.decode_lr_norm dispatches on bw.representation."""
     out: list[torch.Tensor] = []
     bw.decoder.eval()
     with torch.no_grad():
         for s in range(0, latents.shape[0], batch_size):
             z = torch.from_numpy(latents[s:s + batch_size]).to(device)
-            out.append(bw.decoder(z))
+            out.append(bw.decode_lr_norm(z))
     return torch.cat(out, dim=0)
 
 
@@ -444,9 +446,9 @@ def plot_duration_scatter(
 
 
 def plot_reconstruction_examples(
-    sa_true:        np.ndarray,                       # (B, 6, L) normalized SA, ground truth
-    sa_decode_true: np.ndarray,                       # (B, 6, L) decode(true_latent)
-    sa_decode_pred: np.ndarray,                       # (B, 6, L) decode(pred_latent)
+    sa_true:        np.ndarray,                       # (B, 6, L) L/R-norm, ground truth
+    sa_decode_true: np.ndarray,                       # (B, 6, L) L/R-norm decode(true_latent)
+    sa_decode_pred: np.ndarray,                       # (B, 6, L) L/R-norm decode(pred_latent)
     save_path:      str,
     n_examples:     int = 6,
     seed:           int = 0,
@@ -456,19 +458,15 @@ def plot_reconstruction_examples(
       ground truth (solid), decode(true_latent) (dashed, AE-only reconstruction),
       decode(pred_latent) (dotted, end-to-end). All in degrees on the y-axis.
 
-    Reconstructions live in normalized L/R space; we convert to degrees via
-    WING_ANGLE_SCALE so the y-axis is physical.
+    Inputs are already in per-angle-normalized L/R space (uniform across
+    representations); we convert to degrees via WING_ANGLE_SCALE for the y-axis.
     """
     rng = np.random.default_rng(seed)
     n_avail = sa_true.shape[0]
     pick = rng.choice(n_avail, size=min(n_examples, n_avail), replace=False)
 
-    # Convert SA → L/R-norm → degrees for plotting. Use the existing helper on
-    # a torch tensor for parity with the rest of the eval, then back to numpy.
     def _to_deg(x: np.ndarray) -> np.ndarray:
-        t = torch.from_numpy(x[pick])
-        lr = sa_to_lr_norm(t).numpy()                                          # (k, 6, L)
-        return lr * WING_ANGLE_SCALE[None, :, None] * (180.0 / np.pi)
+        return x[pick] * WING_ANGLE_SCALE[None, :, None] * (180.0 / np.pi)     # (k, 6, L)
 
     truth_deg = _to_deg(sa_true)
     dec_t_deg = _to_deg(sa_decode_true)
@@ -564,16 +562,23 @@ def run_evaluation(
     if n_val == 0:
         raise RuntimeError("Empty val split — check that the AE val_indices.json matches the dataset.")
 
+    representation = bw.representation
+    print(f"Representation: {representation}  (n_wings={bw.n_wings})")
+
     # --- Predictions on the full val set ---
     preds = _predict_val(bw, splits, device=device)
-    pred_latents = preds["pred_latents"]
+    pred_latents = preds["pred_latents"]            # (N, D) or (N, 2, D)
     true_latents = preds["true_latents"]
     pred_dur     = preds["pred_durations"]
     true_dur     = preds["true_durations"]
+    # Retrieval and per-dim R² operate on the flat per-wingbeat latent; for
+    # single_wing that is the concatenation [z_L, z_R] (2·D dims).
+    pred_flat = pred_latents.reshape(len(pred_latents), -1)
+    true_flat = true_latents.reshape(len(true_latents), -1)
 
     # --- 1. Retrieval / percentile ---
     print("\n=== Retrieval / percentile metrics ===")
-    retrieval = compute_retrieval_metrics(pred_latents, true_latents)
+    retrieval = compute_retrieval_metrics(pred_flat, true_flat)
     for key in ("n_val", "median_rank", "median_percentile",
                 "top1_accuracy", "top10_accuracy", "top100_accuracy"):
         if key in retrieval:
@@ -582,8 +587,9 @@ def run_evaluation(
     plot_retrieval(retrieval, os.path.join(save_dir, "retrieval.png"))
 
     # --- 2 / 3. Decoded RMSE in degrees (regressor's added error) + per-dim R^2 ---
-    decoded_pred = _decode(bw, pred_latents, device=device)                    # (N_val, 6, L)
-    decoded_true = _decode(bw, true_latents, device=device)
+    # Decode into per-angle-normalized L/R space (uniform across representations).
+    decoded_pred = _decode_lr(bw, pred_latents, device=device)                 # (N_val, 6, L)
+    decoded_true = _decode_lr(bw, true_latents, device=device)
     added_per_channel = decoded_rmse_deg(decoded_pred, decoded_true)
     added_mean = float(np.mean(added_per_channel))
     print(f"\n=== Decoded RMSE in degrees (decode(pred) vs decode(true)) ===")
@@ -591,7 +597,7 @@ def run_evaluation(
         print(f"  {label:<8s} {v:7.3f}°")
     print(f"  {'mean':<8s} {added_mean:7.3f}°")
 
-    r2_per_dim = compute_per_dim_r2(pred_latents, true_latents)
+    r2_per_dim = compute_per_dim_r2(pred_flat, true_flat)
     plot_per_dim_r2(r2_per_dim, os.path.join(save_dir, "per_dim_r2.png"))
 
     # --- 4. Duration ---
@@ -611,10 +617,19 @@ def run_evaluation(
     # fragile: the npz's filtering differs and can silently misalign rows).
     floor_per_channel = None
     e2e_per_channel   = None
-    sa_true_aligned   = None
+    gt_lr             = None   # (n_val, 6, L) ground truth in per-angle-normalized L/R space
 
-    if "sa_wingbeats" in splits:
-        sa_true_aligned = splits["sa_wingbeats"][splits["val_idx"]]
+    vi = splits["val_idx"]
+    if representation == "single_wing" and "single_wing_left" in splits:
+        # Stack the stored left/right single-wing residuals; they ARE the per-angle-
+        # normalized L/R channels, so no S/A inversion is needed.
+        gt_lr = np.concatenate(
+            [splits["single_wing_left"][vi], splits["single_wing_right"][vi]], axis=1
+        )                                                                       # (n_val, 6, L)
+        gt_source = f"{dataset_path} (stored single_wing_left/right)"
+    elif "sa_wingbeats" in splits:
+        sa_norm = splits["sa_wingbeats"][vi]                                    # (n_val, 6, L) SA-norm
+        gt_lr = sa_to_lr_norm(torch.from_numpy(sa_norm)).numpy()
         gt_source = f"{dataset_path} (stored sa_wingbeats)"
     else:
         ae_config_path = os.path.join(a_dir, "best_config.json")
@@ -625,17 +640,18 @@ def run_evaluation(
             data_dir = os.path.dirname(os.path.abspath(ae_config["data_path"]))
             npz_path = os.path.join(data_dir, f"wingbeats_L{L}.npz")
         if npz_path and os.path.exists(npz_path):
-            print(f"\nNo stored sa_wingbeats in dataset — aligning val ground truth "
+            print(f"\nNo stored ground truth in dataset — aligning val ground truth "
                   f"by position from {npz_path} (legacy path; rebuild the dataset to fix).")
             sa_true_aligned, _ = _align_val_sa_to_regressor(npz_path, splits)
+            gt_lr = sa_to_lr_norm(torch.from_numpy(sa_true_aligned)).numpy()
             gt_source = npz_path
         else:
             gt_source = None
 
-    if sa_true_aligned is not None:
-        sa_true_t = torch.from_numpy(sa_true_aligned).to(device)
-        floor_per_channel = decoded_rmse_deg(decoded_true, sa_true_t)
-        e2e_per_channel   = decoded_rmse_deg(decoded_pred, sa_true_t)
+    if gt_lr is not None:
+        gt_lr_t = torch.from_numpy(gt_lr).to(device)
+        floor_per_channel = decoded_rmse_deg(decoded_true, gt_lr_t)
+        e2e_per_channel   = decoded_rmse_deg(decoded_pred, gt_lr_t)
         print(f"\n=== Error-floor decomposition (RMSE in degrees, averaged over 6 channels) ===")
         print(f"  Ground truth: {gt_source}")
         print(f"  AE floor     = {float(np.mean(floor_per_channel)):.3f}°")
@@ -664,9 +680,9 @@ def run_evaluation(
     )
 
     # --- 6. Reconstruction example plot (only if ground truth is available) ---
-    if sa_true_aligned is not None:
+    if gt_lr is not None:
         plot_reconstruction_examples(
-            sa_true        = sa_true_aligned,
+            sa_true        = gt_lr,
             sa_decode_true = decoded_true.cpu().numpy(),
             sa_decode_pred = decoded_pred.cpu().numpy(),
             save_path      = os.path.join(save_dir, "reconstruction_examples.png"),
@@ -683,7 +699,9 @@ def run_evaluation(
         "ground_truth_source": gt_source,
         "wingbeats_npz":    npz_path if npz_path and os.path.exists(npz_path) else None,
         "n_val":            int(n_val),
-        "latent_dim":       int(pred_latents.shape[1]),
+        "representation":   representation,
+        "n_wings":          int(bw.n_wings),
+        "latent_dim":       int(pred_flat.shape[1]),
         "body_feature_indices": [int(i) for i in bw.body_indices.tolist()],
         "body_feature_names":   [BODY_CHANNEL_NAMES[int(i)] for i in bw.body_indices.tolist()],
         "retrieval": {

@@ -59,23 +59,80 @@ def sa_to_lr_norm(x: torch.Tensor) -> torch.Tensor:
     return torch.cat([s + a, s - a], dim=1)
 
 
-def channel_rmse_to_degrees(mse_per_channel: np.ndarray) -> np.ndarray:
+def channel_rmse_to_degrees(mse_per_channel: np.ndarray, scale: np.ndarray | None = None) -> np.ndarray:
     """
-    Convert per-channel MSE measured in WING_ANGLE_SCALE-normalized L/R space
-    into per-channel RMSE in degrees:
-        rmse_rad = sqrt(mse) * WING_ANGLE_SCALE
+    Convert per-channel MSE measured in `scale`-normalized space into per-channel
+    RMSE in degrees:
+        rmse_rad = sqrt(mse) * scale
         rmse_deg = rmse_rad * 180 / pi
+
+    `scale` defaults to WING_ANGLE_SCALE (the 6-ch L/R per-angle scale). The
+    single-wing representation passes its 3-ch scale [π, 0.5, π] instead.
     """
+    if scale is None:
+        scale = WING_ANGLE_SCALE
+    scale = np.asarray(scale, dtype=np.float64)
     rmse_normalized = np.sqrt(np.asarray(mse_per_channel, dtype=np.float64))
-    rmse_rad = rmse_normalized * WING_ANGLE_SCALE
+    rmse_rad = rmse_normalized * scale
     return rmse_rad * (180.0 / np.pi)
 
 
-def format_rmse_degrees(rmse_deg: np.ndarray) -> str:
-    """Compact per-channel RMSE-degrees readout, L | R split for legibility."""
-    l_part = " ".join(f"{d:.2f}" for d in rmse_deg[:3])
-    r_part = " ".join(f"{d:.2f}" for d in rmse_deg[3:])
-    return f"rmse_deg(L φ/θ/ψ | R φ/θ/ψ)=[{l_part} | {r_part}]  mean={rmse_deg.mean():.2f}"
+# ---------------------------------------------------------------------------
+# Representation registry: maps a wing-representation name to channel count,
+# physical scale, labels, and the conversion used to put encoder outputs into the
+# per-angle-normalized space where RMSE-degrees is computed. Lets the autoencoder
+# and downstream evals run on either the 6-ch S/A representation or the new 3-ch
+# single-wing representation without sprinkling `if channels == 3` everywhere.
+# ---------------------------------------------------------------------------
+
+# 3-channel single-wing labels/scale (one wing: [phi, theta, psi]).
+SINGLE_WING_LABELS = ('phi', 'theta', 'psi')
+SINGLE_WING_SCALE  = np.array([np.pi, 0.5, np.pi], dtype=np.float64)
+
+
+def _identity_norm(x: torch.Tensor) -> torch.Tensor:
+    """No-op conversion: single-wing encoder channels are already per-angle-normalized
+    wing residuals, so RMSE is computed on them directly."""
+    return x
+
+
+REPRESENTATIONS: dict[str, dict] = {
+    "sa": {
+        "n_channels":       6,
+        "channel_labels":   WING_ANGLE_LABELS,
+        "channel_scale":    WING_ANGLE_SCALE,
+        "to_physical_norm": sa_to_lr_norm,        # (B,6,L) S/A-norm → (B,6,L) L/R-norm
+        "input_scale":      SA_PHYSICAL_SCALE,    # (6,) AE-input normalizer
+        "array_key":        "sa_wingbeats",       # npz key the AE reads
+    },
+    "single_wing": {
+        "n_channels":       3,
+        "channel_labels":   SINGLE_WING_LABELS,
+        "channel_scale":    SINGLE_WING_SCALE,
+        "to_physical_norm": _identity_norm,
+        "input_scale":      SINGLE_WING_SCALE.astype(np.float32),
+        "array_key":        "single_wing_wingbeats",
+    },
+}
+
+
+def get_representation(name: str = "sa") -> dict:
+    """Return the representation spec dict; defaults to 'sa' (the original 6-ch behavior)."""
+    if name not in REPRESENTATIONS:
+        raise ValueError(f"Unknown representation {name!r}. Options: {sorted(REPRESENTATIONS)}.")
+    return REPRESENTATIONS[name]
+
+
+def format_rmse_degrees(rmse_deg: np.ndarray, labels: tuple = WING_ANGLE_LABELS) -> str:
+    """Compact per-channel RMSE-degrees readout. For the 6-ch L/R layout it splits
+    L | R; for any other channel count it prints a flat per-channel list."""
+    rmse_deg = np.asarray(rmse_deg)
+    if len(rmse_deg) == 6 and labels == WING_ANGLE_LABELS:
+        l_part = " ".join(f"{d:.2f}" for d in rmse_deg[:3])
+        r_part = " ".join(f"{d:.2f}" for d in rmse_deg[3:])
+        return f"rmse_deg(L φ/θ/ψ | R φ/θ/ψ)=[{l_part} | {r_part}]  mean={rmse_deg.mean():.2f}"
+    body = " ".join(f"{lab}={d:.2f}" for lab, d in zip(labels, rmse_deg))
+    return f"rmse_deg[{body}]  mean={rmse_deg.mean():.2f}"
 
 
 # ---------------------------------------------------------------------------

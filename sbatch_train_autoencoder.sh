@@ -4,7 +4,7 @@
 #SBATCH -e logs/%x_%J.err
 #SBATCH --mem=256g
 #SBATCH --cpus-per-task=4
-#SBATCH --time=10:00:00
+#SBATCH --time=05:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --mail-user=lior.kotlar@mail.huji.ac.il
 #SBATCH --mail-type=END,FAIL

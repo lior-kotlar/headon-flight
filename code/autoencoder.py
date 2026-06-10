@@ -29,8 +29,12 @@ from transform_data import (
     _wingbeat_peaks,
     _segment_to_sa,
     _sa_to_segment,
+    _segment_to_single_wing,
+    _single_wing_to_segment,
     _cubic_resample,
     SA_PHYSICAL_SCALE,
+    SINGLE_WING_PHYSICAL_SCALE,
+    single_wing_template_path,
     build_fixed_len_dataset_from_disk,
     fixed_len_dataset_is_valid,
     fixed_len_dataset_path,
@@ -42,6 +46,7 @@ from data_handling.bucket_eval import (
     sa_to_lr_norm     as _sa_to_lr_norm,
     channel_rmse_to_degrees as _channel_rmse_to_degrees,
     format_rmse_degrees     as _format_rmse_degrees,
+    get_representation,
     evaluate_by_maneuver_bucket,
     plot_per_phase_error,
     plot_phase_range_distributions,
@@ -257,6 +262,8 @@ class WingbeatAutoencoder(nn.Module):
             decoder_kernel_size, output_len,
         )
         self.latent_dim          = latent_dim
+        self.in_channels         = in_channels
+        self.out_channels        = in_channels
         self.activation          = activation
         self.dropout             = dropout
         self.base_channels       = base_channels
@@ -286,8 +293,8 @@ class FixedLenWingbeatDataset(Dataset):
     """
 
     def __init__(self, sa_wingbeats: np.ndarray):
-        if sa_wingbeats.ndim != 3 or sa_wingbeats.shape[1] != 6:
-            raise ValueError(f"sa_wingbeats must be (N, 6, L); got {sa_wingbeats.shape}")
+        if sa_wingbeats.ndim != 3:
+            raise ValueError(f"wingbeats must be (N, C, L); got {sa_wingbeats.shape}")
         # One torch tensor lets the DataLoader hand out views without per-sample copies.
         self.samples = torch.from_numpy(np.ascontiguousarray(sa_wingbeats, dtype=np.float32))
         self.L = int(sa_wingbeats.shape[-1])
@@ -379,9 +386,11 @@ def train_autoencoder(
     derivative_weight: float = 0.0,
     restart_check_epoch: int | None = None,
     restart_threshold: float | None = None,
+    representation: str = 'sa',
 ) -> tuple[list[float], list[float], dict, bool, np.ndarray | None]:
     """
-    Trains the autoencoder over fixed-length wingbeats (shape (6, L)).
+    Trains the autoencoder over fixed-length wingbeats (shape (C, L), C from the
+    representation: 6 for 'sa', 3 for 'single_wing').
 
     If both `restart_check_epoch` and `restart_threshold` are set, training aborts
     early once epoch `restart_check_epoch` completes if the best val loss so far is
@@ -406,11 +415,20 @@ def train_autoencoder(
     optimizer = _make_optimizer(optimizer_name, model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, patience=4, factor=0.5)
 
-    # channel_loss_weight is now (alpha_s, alpha_a): a 2-tuple that the code broadcasts to
-    # the 6 channels [S_phi, S_theta, S_psi, A_phi, A_theta, A_psi] as [αs, αs, αs, αa, αa, αa].
-    # None or all-ones → unweighted MSE.
+    # Representation spec: drives channel count, the conversion into per-angle-normalized
+    # space for the val RMSE, and the per-channel scale used for RMSE-degrees.
+    repr_spec   = get_representation(representation)
+    n_channels  = repr_spec['n_channels']
+    to_physical = repr_spec['to_physical_norm']
+    chan_scale  = repr_spec['channel_scale']
+    chan_labels = repr_spec['channel_labels']
+
+    # channel_loss_weight is (alpha_s, alpha_a): broadcast to the 6 S/A channels
+    # [S_phi, S_theta, S_psi, A_phi, A_theta, A_psi] as [αs, αs, αs, αa, αa, αa].
+    # Only meaningful for the 'sa' representation (single_wing has no S/A split, so the
+    # A-channel up-weighting hack is dropped); ignored otherwise.
     channel_weight_tensor = None
-    if channel_loss_weight is not None:
+    if channel_loss_weight is not None and representation == 'sa':
         if len(channel_loss_weight) != 2:
             raise ValueError(
                 f"channel_loss_weight must be a 2-element sequence (alpha_s, alpha_a); "
@@ -420,6 +438,8 @@ def train_autoencoder(
         channel_weight_tensor = torch.tensor(
             [alpha_s, alpha_s, alpha_s, alpha_a, alpha_a, alpha_a], dtype=torch.float32,
         )
+    elif channel_loss_weight is not None and representation != 'sa':
+        print(f"  (channel_loss_weight ignored for representation={representation!r})", flush=True)
 
     model.to(device)
     train_losses, val_losses = [], []
@@ -458,7 +478,7 @@ def train_autoencoder(
         if val_loader:
             model.eval()
             total_val = 0.0
-            sse_per_channel = torch.zeros(6, device=device, dtype=torch.float64)
+            sse_per_channel = torch.zeros(n_channels, device=device, dtype=torch.float64)
             n_elements_per_channel = 0
             with torch.no_grad():
                 for x in val_loader:
@@ -467,17 +487,18 @@ def train_autoencoder(
                     # Val loss is unweighted (no channel/endpoint/cycle terms) so it
                     # stays comparable across runs with different loss-weight settings.
                     total_val += _mse_fixed(recon, x).item()
-                    # Per-channel SSE is computed in L/R-residual space so the reported
-                    # RMSE-degrees directly corresponds to per-wing physical angles.
-                    recon_lr  = _sa_to_lr_norm(recon)
-                    target_lr = _sa_to_lr_norm(x)
-                    sq_err = (recon_lr - target_lr).double() ** 2       # (B, 6, L)
+                    # Per-channel SSE in the representation's per-angle-normalized space
+                    # ('sa' → L/R residuals; 'single_wing' → identity), so RMSE-degrees
+                    # corresponds to per-wing physical angles.
+                    recon_p  = to_physical(recon)
+                    target_p = to_physical(x)
+                    sq_err = (recon_p - target_p).double() ** 2          # (B, C, L)
                     sse_per_channel += sq_err.sum(dim=(0, 2))
                     n_elements_per_channel += x.size(0) * x.size(2)
             avg_val = total_val / len(val_loader)
             val_losses.append(avg_val)
             mse_per_channel = (sse_per_channel / max(n_elements_per_channel, 1)).cpu().numpy()
-            val_rmse_deg = _channel_rmse_to_degrees(mse_per_channel)
+            val_rmse_deg = _channel_rmse_to_degrees(mse_per_channel, scale=chan_scale)
             val_rmse_deg_history.append(val_rmse_deg)
 
         monitor = avg_val if avg_val is not None else avg_train
@@ -491,7 +512,7 @@ def train_autoencoder(
 
         msg = f"Epoch {epoch + 1:>4}/{n_epochs}  train={avg_train:.6f}"
         if avg_val is not None:
-            msg += f"  val={avg_val:.6f}  {_format_rmse_degrees(val_rmse_deg)}"
+            msg += f"  val={avg_val:.6f}  {_format_rmse_degrees(val_rmse_deg, labels=chan_labels)}"
         print(msg, flush=True)
 
         # Early-stuck detection: if at the configured check-point the best val loss
@@ -542,9 +563,10 @@ def load_decoder(path: str, device: str = "cpu") -> WingbeatDecoder:
         decoder = load_decoder("data/models/autoencoder/best_decoder.pt")
         wings_L = decoder(z)   # shape (B, 6, decoder.output_len)
     """
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     decoder = WingbeatDecoder(
         latent_dim=ckpt['latent_dim'],
+        out_channels=ckpt.get('out_channels', 6),
         activation=ckpt.get('activation', 'gelu'),
         dropout=ckpt.get('dropout', 0.0),
         base_channels=ckpt.get('base_channels', _BASE_CHANNELS),
@@ -733,6 +755,89 @@ def _save_reconstruction_plotly(
     print(f"Interactive reconstruction plot saved → {html_path}", flush=True)
 
 
+def _plot_reconstructed_trajectory_single_wing(
+    model: WingbeatAutoencoder,
+    val_trajs: list,
+    template3: np.ndarray,
+    save_path: str,
+    device: str,
+    n_beats: int = 5,
+    seed: int | None = None,
+) -> None:
+    """
+    Single-wing analogue of _plot_reconstructed_trajectory. Picks n_beats consecutive
+    wingbeats from a random val trajectory; for each, the LEFT and RIGHT wings are
+    each independently residual-transformed against the single-wing template, run
+    through the 3-channel autoencoder, and inverted back to wing angles. Left is
+    drawn blue, right red — directly comparable to the 6-ch model's reconstruction plot.
+    """
+    rng = np.random.default_rng(seed)
+    candidates = [(traj, _wingbeat_peaks(traj)) for traj in val_trajs]
+    candidates = [(traj, peaks) for traj, peaks in candidates if len(peaks) - 1 >= n_beats]
+    if not candidates:
+        print(f"No validation trajectory has {n_beats} consecutive wingbeats — skipping reconstruction plot.", flush=True)
+        return
+
+    traj, peaks = candidates[rng.integers(len(candidates))]
+    max_start  = len(peaks) - 1 - n_beats
+    start_beat = int(rng.integers(0, max_start + 1))
+
+    model.eval()
+    model.to(device)
+    L = int(model.output_len)
+
+    def _reconstruct_wing(wing_native: np.ndarray, n: int) -> np.ndarray:
+        """wing_native: (n, 3) raw single-wing angles → (n, 3) reconstruction."""
+        res_native = _segment_to_single_wing(wing_native, template3) / SINGLE_WING_PHYSICAL_SCALE  # (n,3)
+        res_L      = _cubic_resample(res_native, L)                                                 # (L,3)
+        x          = torch.from_numpy(res_L.T).unsqueeze(0).to(device)                              # (1,3,L)
+        with torch.no_grad():
+            recon_res_L = model(x).squeeze(0).T.cpu().numpy()                                       # (L,3)
+        recon_res_native = _cubic_resample(recon_res_L, n) * SINGLE_WING_PHYSICAL_SCALE             # (n,3)
+        return _single_wing_to_segment(recon_res_native, template3)                                 # (n,3)
+
+    orig_parts, recon_parts, tmpl_parts = [], [], []
+    for i in range(start_beat, start_beat + n_beats):
+        start, end = int(peaks[i]), int(peaks[i + 1])
+        segment = traj[start:end]                                  # (n, 6)
+        n       = segment.shape[0]
+        left_recon  = _reconstruct_wing(segment[:, 0:3], n)
+        right_recon = _reconstruct_wing(segment[:, 3:6], n)
+        tmpl_matched = _single_wing_to_segment(np.zeros((n, 3), dtype=np.float32), template3)  # (n,3)
+
+        orig_parts.append(segment)
+        recon_parts.append(np.concatenate([left_recon, right_recon], axis=1))   # (n, 6)
+        tmpl_parts.append(np.concatenate([tmpl_matched, tmpl_matched], axis=1))  # (n, 6)
+
+    original       = np.concatenate(orig_parts,  axis=0)
+    reconstruction = np.concatenate(recon_parts, axis=0)
+    template_line  = np.concatenate(tmpl_parts,  axis=0)
+    x_axis         = np.arange(original.shape[0])
+    boundaries     = np.cumsum([0] + [p.shape[0] for p in orig_parts])
+
+    angle_labels = ['Stroke φ [rad]', 'Deviation θ [rad]', 'Rotation ψ [rad]']
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    fig.suptitle(f"Single-Wing Autoencoder — Reconstruction of {n_beats} Consecutive Wingbeats", fontsize=14)
+    for ax, label, lc, rc in zip(axes, angle_labels, [0, 1, 2], [3, 4, 5]):
+        ax.plot(x_axis, original[:, lc],       color='blue', lw=2,   ls='-',  label='Left — original')
+        ax.plot(x_axis, reconstruction[:, lc], color='blue', lw=1.5, ls='--', label='Left — reconstruction')
+        ax.plot(x_axis, template_line[:, lc],  color='blue', lw=1,   ls=':',  alpha=0.5, label='Left — template')
+        ax.plot(x_axis, original[:, rc],       color='red',  lw=2,   ls='-',  label='Right — original')
+        ax.plot(x_axis, reconstruction[:, rc], color='red',  lw=1.5, ls='--', label='Right — reconstruction')
+        ax.plot(x_axis, template_line[:, rc],  color='red',  lw=1,   ls=':',  alpha=0.5, label='Right — template')
+        for b in boundaries[1:-1]:
+            ax.axvline(x=b, color='gray', lw=0.8, ls='--', alpha=0.4)
+        ax.set_ylabel(label)
+        ax.grid(True, alpha=0.4)
+    axes[0].legend(loc='upper right', fontsize=8, ncol=2)
+    axes[2].set_xlabel('Sample Index')
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Single-wing reconstruction plot saved → {save_path}", flush=True)
+
+
 def _save_per_dim_artifacts(
     target_dir: str,
     run_config: dict,
@@ -750,6 +855,7 @@ def _save_per_dim_artifacts(
     seed: int,
     device: str,
     bucket_axes: list,
+    representation: str = 'sa',
 ) -> None:
     """
     Write a per-latent-dim model checkpoint into `target_dir`, plus run the same
@@ -761,6 +867,8 @@ def _save_per_dim_artifacts(
     """
     os.makedirs(target_dir, exist_ok=True)
 
+    repr_spec      = get_representation(representation)
+    n_channels     = repr_spec['n_channels']
     activation     = run_config.get('activation', 'gelu')
     dropout        = run_config.get('dropout', 0.0)
     base_channels  = run_config.get('base_channels', _BASE_CHANNELS)
@@ -772,12 +880,16 @@ def _save_per_dim_artifacts(
     endpoint_s     = run_config.get('endpoint_samples', 3)
     derivative_w   = run_config.get('derivative_weight', 0.0)
     latent_dim     = int(run_config['latent_dim'])
-    sa_scale_list  = SA_PHYSICAL_SCALE.tolist()
+    sa_scale_list  = [float(v) for v in repr_spec['input_scale']]
     val_rmse_list  = None if val_rmse_deg is None else [float(v) for v in val_rmse_deg]
+    chan_labels    = list(repr_spec['channel_labels'])
 
     torch.save({
         'state_dict':          dec_state,
         'latent_dim':          latent_dim,
+        'representation':      representation,
+        'in_channels':         n_channels,
+        'out_channels':        n_channels,
         'activation':          activation,
         'dropout':             dropout,
         'base_channels':       base_channels,
@@ -787,12 +899,15 @@ def _save_per_dim_artifacts(
         'sa_scale':            sa_scale_list,
         'val_loss':            val_loss,
         'val_rmse_deg':        val_rmse_list,
-        'channel_labels':      list(_WING_ANGLE_LABELS),
+        'channel_labels':      chan_labels,
     }, os.path.join(target_dir, 'best_decoder.pt'))
 
     torch.save({
         'state_dict':          ae_state,
         'latent_dim':          latent_dim,
+        'representation':      representation,
+        'in_channels':         n_channels,
+        'out_channels':        n_channels,
         'activation':          activation,
         'dropout':             dropout,
         'base_channels':       base_channels,
@@ -807,7 +922,7 @@ def _save_per_dim_artifacts(
         'sa_scale':            sa_scale_list,
         'val_loss':            val_loss,
         'val_rmse_deg':        val_rmse_list,
-        'channel_labels':      list(_WING_ANGLE_LABELS),
+        'channel_labels':      chan_labels,
     }, os.path.join(target_dir, 'best_autoencoder.pt'))
 
     with open(os.path.join(target_dir, 'best_config.json'), 'w') as f:
@@ -823,6 +938,7 @@ def _save_per_dim_artifacts(
 
     model = WingbeatAutoencoder(
         latent_dim          = latent_dim,
+        in_channels         = n_channels,
         activation          = activation,
         dropout             = dropout,
         base_channels       = base_channels,
@@ -836,16 +952,29 @@ def _save_per_dim_artifacts(
     eval_dir = os.path.join(target_dir, "eval")
     os.makedirs(eval_dir, exist_ok=True)
 
-    _plot_reconstructed_trajectory(
-        model     = model,
-        val_trajs = val_trajs,
-        template  = template,
-        save_path = os.path.join(eval_dir, "reconstruction.png"),
-        device    = device,
-        seed      = seed,
-    )
+    if representation == 'single_wing':
+        template3 = np.load(single_wing_template_path(template_path))
+        _plot_reconstructed_trajectory_single_wing(
+            model     = model,
+            val_trajs = val_trajs,
+            template3 = template3,
+            save_path = os.path.join(eval_dir, "reconstruction.png"),
+            device    = device,
+            seed      = seed,
+        )
+    else:
+        _plot_reconstructed_trajectory(
+            model     = model,
+            val_trajs = val_trajs,
+            template  = template,
+            save_path = os.path.join(eval_dir, "reconstruction.png"),
+            device    = device,
+            seed      = seed,
+        )
 
-    if bucket_axes:
+    # The per-phase / per-bucket evals decode S/A → L/R and assume 6 channels;
+    # they're only run for the 'sa' representation for now.
+    if bucket_axes and representation == 'sa':
         per_phase = plot_per_phase_error(
             model              = model,
             npz_path           = fl_dataset_path,
@@ -914,6 +1043,13 @@ def main():
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+    # Representation: 'sa' (default, 6-ch S/A) or 'single_wing' (3-ch one wing at a time).
+    representation = fixed.get('representation', 'sa')
+    repr_spec      = get_representation(representation)
+    n_channels     = repr_spec['n_channels']
+    repr_array_key = repr_spec['array_key']
+    print(f"Representation: {representation}  (in/out channels = {n_channels}, npz key = {repr_array_key})")
+
     # --- Auto-build every fixed-length dataset the grid will reference ---
     # fixed_len may be a sweep dim, so collect all unique L values that any combo
     # will request, then build the ones that are missing or stale.
@@ -923,14 +1059,15 @@ def main():
     auto_build = bool(fixed.get('auto_build_dataset', True))
     data_dir   = os.path.dirname(os.path.abspath(fixed['data_path']))
     for L_val in unique_fixed_lens:
-        path = fixed_len_dataset_path(data_dir, L_val)
-        scar = fixed_len_sidecar_path(data_dir, L_val)
+        path = fixed_len_dataset_path(data_dir, L_val, representation)
+        scar = fixed_len_sidecar_path(data_dir, L_val, representation)
         is_valid, reason = fixed_len_dataset_is_valid(
             output_path       = path,
             sidecar_path      = scar,
             L                 = L_val,
             trajectories_path = fixed['data_path'],
             template_path     = fixed['template_path'],
+            representation    = representation,
         )
         if not is_valid:
             if not auto_build:
@@ -945,6 +1082,7 @@ def main():
                 trajectories_path = fixed['data_path'],
                 template_path     = fixed['template_path'],
                 output_path       = path,
+                representation    = representation,
             )
 
     # --- L-agnostic state: template + trajectory list + train/val split (trajectory level) ---
@@ -969,13 +1107,13 @@ def main():
 
     def _get_datasets_for_L(L_val: int) -> tuple['FixedLenWingbeatDataset', 'FixedLenWingbeatDataset', str]:
         if L_val not in _dataset_cache:
-            path           = fixed_len_dataset_path(data_dir, L_val)
+            path           = fixed_len_dataset_path(data_dir, L_val, representation)
             fl_data        = np.load(path)
-            sa_wingbeats   = fl_data['sa_wingbeats']       # (N, 6, L) float32, normalized
+            wingbeats      = fl_data[repr_array_key]        # (N, C, L) float32, normalized
             trajectory_ids = fl_data['trajectory_ids']
             val_mask       = np.array([int(t) in val_traj_set for t in trajectory_ids], dtype=bool)
-            train_ds       = FixedLenWingbeatDataset(sa_wingbeats[~val_mask])
-            val_ds         = FixedLenWingbeatDataset(sa_wingbeats[ val_mask])
+            train_ds       = FixedLenWingbeatDataset(wingbeats[~val_mask])
+            val_ds         = FixedLenWingbeatDataset(wingbeats[ val_mask])
             _dataset_cache[L_val] = (train_ds, val_ds, path)
         return _dataset_cache[L_val]
 
@@ -1025,6 +1163,7 @@ def main():
     def _build_model(rcfg: dict) -> WingbeatAutoencoder:
         return WingbeatAutoencoder(
             latent_dim=rcfg['latent_dim'],
+            in_channels=n_channels,
             activation=rcfg.get('activation', 'gelu'),
             dropout=rcfg.get('dropout', 0.0),
             base_channels=rcfg.get('base_channels', _BASE_CHANNELS),
@@ -1097,6 +1236,7 @@ def main():
                 derivative_weight   = run_config.get('derivative_weight', 0.0),
                 restart_check_epoch = restart_check_epoch,
                 restart_threshold   = restart_threshold,
+                representation      = representation,
             )
 
             if not was_stuck or attempt >= restart_max_attempts:
@@ -1109,7 +1249,7 @@ def main():
 
         model.load_state_dict(best_state)
         run_best = min(val_losses) if val_losses else min(train_losses)
-        rmse_msg = f"  {_format_rmse_degrees(best_val_rmse_deg)}" if best_val_rmse_deg is not None else ""
+        rmse_msg = f"  {_format_rmse_degrees(best_val_rmse_deg, labels=repr_spec['channel_labels'])}" if best_val_rmse_deg is not None else ""
         h, rem = divmod(int(train_seconds), 3600)
         m, s   = divmod(rem, 60)
         train_time_hms = f"{h:d}:{m:02d}:{s:02d}"
@@ -1164,18 +1304,23 @@ def main():
     best_endpoint_weight     = best_run_config.get('endpoint_weight', 1.0)
     best_endpoint_samples    = best_run_config.get('endpoint_samples', 3)
     best_derivative_weight   = best_run_config.get('derivative_weight', 0.0)
-    # SA scale is included so a loader can recover physical units without re-importing the constant.
-    sa_scale_list = SA_PHYSICAL_SCALE.tolist()
+    # The input scale (per-representation) is included so a loader can recover physical
+    # units without re-importing the constant.
+    sa_scale_list = [float(v) for v in repr_spec['input_scale']]
+    best_channel_labels = list(repr_spec['channel_labels'])
     val_rmse_deg_list = (
         None if best_run_val_rmse_deg is None else [float(v) for v in best_run_val_rmse_deg]
     )
     # Overall-best L may differ from any individual combo's L when fixed_len is swept.
     best_fixed_len_L     = int(best_run_config['fixed_len'])
-    best_fl_dataset_path = fixed_len_dataset_path(data_dir, best_fixed_len_L)
+    best_fl_dataset_path = fixed_len_dataset_path(data_dir, best_fixed_len_L, representation)
     torch.save(
         {
             'state_dict':          best_decoder_state,
             'latent_dim':          best_run_config['latent_dim'],
+            'representation':      representation,
+            'in_channels':         n_channels,
+            'out_channels':        n_channels,
             'activation':          best_activation,
             'dropout':             best_dropout,
             'base_channels':       best_base_channels,
@@ -1185,7 +1330,7 @@ def main():
             'sa_scale':            sa_scale_list,
             'val_loss':            best_val_loss,
             'val_rmse_deg':        val_rmse_deg_list,
-            'channel_labels':      list(_WING_ANGLE_LABELS),
+            'channel_labels':      best_channel_labels,
         },
         os.path.join(save_dir, 'best_decoder.pt'),
     )
@@ -1195,6 +1340,9 @@ def main():
         {
             'state_dict':          best_autoencoder_state,
             'latent_dim':          best_run_config['latent_dim'],
+            'representation':      representation,
+            'in_channels':         n_channels,
+            'out_channels':        n_channels,
             'activation':          best_activation,
             'dropout':             best_dropout,
             'base_channels':       best_base_channels,
@@ -1209,7 +1357,7 @@ def main():
             'sa_scale':            sa_scale_list,
             'val_loss':            best_val_loss,
             'val_rmse_deg':        val_rmse_deg_list,
-            'channel_labels':      list(_WING_ANGLE_LABELS),
+            'channel_labels':      best_channel_labels,
         },
         os.path.join(save_dir, 'best_autoencoder.pt'),
     )
@@ -1236,6 +1384,7 @@ def main():
     # --- Reconstruction plot using the best model across the entire grid search ---
     best_model = WingbeatAutoencoder(
         latent_dim=best_run_config['latent_dim'],
+        in_channels=n_channels,
         activation=best_activation,
         dropout=best_dropout,
         base_channels=best_base_channels,
@@ -1245,19 +1394,30 @@ def main():
     )
     best_model.load_state_dict(best_autoencoder_state)
     best_model.to(device)
-    _plot_reconstructed_trajectory(
-        model      = best_model,
-        val_trajs  = val_trajs,
-        template   = template,
-        save_path  = os.path.join(analysis_dir, "best_model_reconstruction.png"),
-        device     = device,
-        seed       = seed,
-    )
+    if representation == 'single_wing':
+        _plot_reconstructed_trajectory_single_wing(
+            model      = best_model,
+            val_trajs  = val_trajs,
+            template3  = np.load(single_wing_template_path(fixed['template_path'])),
+            save_path  = os.path.join(analysis_dir, "best_model_reconstruction.png"),
+            device     = device,
+            seed       = seed,
+        )
+    else:
+        _plot_reconstructed_trajectory(
+            model      = best_model,
+            val_trajs  = val_trajs,
+            template   = template,
+            save_path  = os.path.join(analysis_dir, "best_model_reconstruction.png"),
+            device     = device,
+            seed       = seed,
+        )
 
     # --- Bucket eval on the overall best model. Same axes as the per-config eval.
     # Output files have no run-label prefix so this matches the manual evaluator.
+    # The per-phase/per-bucket evals are S/A-only for now (gated on representation).
     bucket_axes = fixed.get('post_training_bucket_eval_axes', ['max'])
-    if bucket_axes:
+    if bucket_axes and representation == 'sa':
         eval_dir = os.path.join(save_dir, "eval")
         os.makedirs(eval_dir, exist_ok=True)
         # Per-phase error plot is independent of score_axis, so run it once.
@@ -1333,6 +1493,7 @@ def main():
                 seed             = seed,
                 device           = device,
                 bucket_axes      = bucket_axes,
+                representation   = representation,
             )
 
     # --- Cross-run summary: fixed_len vs performance.

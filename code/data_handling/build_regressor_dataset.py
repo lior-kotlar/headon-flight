@@ -42,8 +42,11 @@ from autoencoder import WingbeatAutoencoder
 from transform_data import (
     _wingbeat_peaks,
     _segment_to_sa,
+    _segment_to_single_wing,
     _cubic_resample,
     SA_PHYSICAL_SCALE,
+    SINGLE_WING_PHYSICAL_SCALE,
+    single_wing_template_path,
     trajectory_asymmetry_score,
 )
 from process_data import PROCESSED_TRAIN_FLIGHT_DATA_DIR, _extract_features_and_targets
@@ -70,12 +73,14 @@ def _resolve_model_dir(model_dir: str) -> str:
     return latest
 
 
-def _load_autoencoder(model_dir: str, device: str) -> WingbeatAutoencoder:
+def _load_autoencoder(model_dir: str, device: str) -> tuple[WingbeatAutoencoder, str]:
     ckpt_path = os.path.join(model_dir, "best_autoencoder.pt")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    representation = ckpt.get("representation", "sa")
     # Dropout is irrelevant in eval mode; we still construct with the saved value for parity.
     model = WingbeatAutoencoder(
         latent_dim          = ckpt["latent_dim"],
+        in_channels         = ckpt.get("in_channels", 6),
         activation          = ckpt.get("activation", "gelu"),
         dropout             = ckpt.get("dropout", 0.0),
         base_channels       = ckpt.get("base_channels", 128),
@@ -86,12 +91,12 @@ def _load_autoencoder(model_dir: str, device: str) -> WingbeatAutoencoder:
     model.load_state_dict(ckpt["state_dict"])
     model.to(device).eval()
     print(
-        f"Autoencoder loaded: latent_dim={model.latent_dim}  "
-        f"base_channels={model.base_channels}  bottleneck_len={model.bottleneck_len}  "
-        f"output_len={model.output_len}  "
+        f"Autoencoder loaded: representation={representation}  latent_dim={model.latent_dim}  "
+        f"in_channels={model.in_channels}  base_channels={model.base_channels}  "
+        f"bottleneck_len={model.bottleneck_len}  output_len={model.output_len}  "
         f"val_loss={ckpt.get('val_loss', 'unknown')}"
     )
-    return model
+    return model, representation
 
 
 def _load_filtered_trajectories(
@@ -142,14 +147,16 @@ def _load_filtered_trajectories(
     return body_list, wing_list
 
 
-def regressor_dataset_path(data_dir: str, latent_dim: int, L: int) -> str:
+def regressor_dataset_path(data_dir: str, latent_dim: int, L: int, representation: str = "sa") -> str:
     """Canonical dataset path, keyed on the (latent_dim, L) of the source autoencoder.
+    The single-wing variant is tagged so it never collides with the 6-ch dataset.
     Lets callers derive the file a given autoencoder needs instead of hardcoding it."""
-    return os.path.join(data_dir, f"wingbeat_regressor_dataset_dim{latent_dim}_L{L}.npz")
+    tag = "" if representation == "sa" else "single_wing_"
+    return os.path.join(data_dir, f"wingbeat_regressor_dataset_{tag}dim{latent_dim}_L{L}.npz")
 
 
-def regressor_dataset_sidecar_path(data_dir: str, latent_dim: int, L: int) -> str:
-    return os.path.splitext(regressor_dataset_path(data_dir, latent_dim, L))[0] + ".json"
+def regressor_dataset_sidecar_path(data_dir: str, latent_dim: int, L: int, representation: str = "sa") -> str:
+    return os.path.splitext(regressor_dataset_path(data_dir, latent_dim, L, representation))[0] + ".json"
 
 
 def regressor_dataset_is_valid(
@@ -159,11 +166,13 @@ def regressor_dataset_is_valid(
     latent_dim: int,
     L: int,
     autoencoder_model_dir: str,
+    representation: str = "sa",
 ) -> tuple[bool, str]:
     """Returns (is_valid, reason). False means the dataset is missing or was built
-    against a different autoencoder (latent_dim / L / model dir) and must be rebuilt.
-    Keying on autoencoder_model_dir (not just latent_dim) means pointing at a
-    *different* dim-D autoencoder also forces a rebuild rather than reusing stale latents."""
+    against a different autoencoder (latent_dim / L / model dir / representation) and
+    must be rebuilt. Keying on autoencoder_model_dir (not just latent_dim) means
+    pointing at a *different* dim-D autoencoder also forces a rebuild rather than
+    reusing stale latents."""
     if not os.path.exists(output_path):
         return False, f"missing dataset {output_path}"
     if not os.path.exists(sidecar_path):
@@ -173,6 +182,8 @@ def regressor_dataset_is_valid(
             meta = json.load(f)
     except json.JSONDecodeError as e:
         return False, f"corrupt sidecar: {e}"
+    if meta.get("representation", "sa") != representation:
+        return False, f"representation mismatch ({meta.get('representation', 'sa')} ≠ {representation})"
     if int(meta.get("latent_dim", -1)) != int(latent_dim):
         return False, f"latent_dim mismatch ({meta.get('latent_dim')} ≠ {latent_dim})"
     if int(meta.get("L", -1)) != int(L):
@@ -203,27 +214,47 @@ def build_regressor_dataset(
     print(f"Template: {template.shape}")
 
     model_dir = _resolve_model_dir(model_dir)
-    model     = _load_autoencoder(model_dir, device=device)
+    model, representation = _load_autoencoder(model_dir, device=device)
     latent_dim = model.latent_dim
+    L = int(model.output_len)
+
+    # Single-wing needs the 3-ch template + scale; the 6-ch SA path uses the golden template.
+    if representation == "single_wing":
+        template3 = np.load(single_wing_template_path(template_path))
+        print(f"Single-wing template: {template3.shape}")
+        sw_scale = torch.from_numpy(SINGLE_WING_PHYSICAL_SCALE).view(3, 1).to(device)
+    else:
+        sa_scale = torch.from_numpy(SA_PHYSICAL_SCALE).view(6, 1).to(device)
 
     body_list, wing_list = _load_filtered_trajectories(
         processed_dir, asymmetry_max_multiple, use_radians=True,
     )
     n_traj = len(body_list)
-    print(f"{n_traj} trajectories after filtering — processing wingbeats...")
-
-    sa_scale = torch.from_numpy(SA_PHYSICAL_SCALE).view(6, 1).to(device)
-    L = int(model.output_len)
-    print(f"Resampling each wingbeat to L={L} samples (CubicSpline) before encoding.")
+    print(f"{n_traj} trajectories after filtering — processing wingbeats "
+          f"(representation={representation}, L={L})...")
 
     body_means_list:      list[np.ndarray] = []
     next_body_means_list: list[np.ndarray] = []
-    target_latents_list:  list[np.ndarray] = []
-    sa_wingbeats_list:    list[np.ndarray] = []   # (6, L) normalized SA actually fed to the encoder
     durations_list:       list[int]        = []
     trajectory_ids_list:  list[int]        = []
+    # 'sa' path
+    target_latents_list:  list[np.ndarray] = []
+    sa_wingbeats_list:    list[np.ndarray] = []   # (6, L) normalized SA fed to the encoder
+    # 'single_wing' path
+    latents_left_list:    list[np.ndarray] = []
+    latents_right_list:   list[np.ndarray] = []
+    wing_left_list:       list[np.ndarray] = []   # (3, L) normalized left-wing residual
+    wing_right_list:      list[np.ndarray] = []
     n_skipped         = 0    # current or next wingbeat had non-positive duration
     n_dropped_last    = 0    # last wingbeat of trajectory, no "next" available
+
+    def _encode_single_wing(wing3: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """raw single-wing angles (n, 3) → ((3, L) normalized residual, (D,) latent)."""
+        res   = _segment_to_single_wing(wing3, template3)                     # (n, 3)
+        res_L = _cubic_resample(res, L)                                        # (L, 3)
+        x     = torch.as_tensor(res_L.T, device=device).unsqueeze(0) / sw_scale  # (1, 3, L)
+        z     = model.encoder(x).squeeze(0).cpu().numpy().astype(np.float32)
+        return x.squeeze(0).cpu().numpy().astype(np.float32), z
 
     with torch.no_grad():
         for traj_id, (body, wing) in enumerate(zip(body_list, wing_list)):
@@ -254,22 +285,30 @@ def build_regressor_dataset(
                 body_mean      = body_segment.mean(axis=0).astype(np.float32)     # (12,)
                 next_body_mean = next_body_segment.mean(axis=0).astype(np.float32)  # (12,)
 
-                # Build the same input the encoder was trained on: SA at native length,
-                # CubicSpline-resampled to L, transposed to (6, L), divided by SA_PHYSICAL_SCALE.
-                sa = _segment_to_sa(wing_segment, template)                       # (n, 6)
-                sa_L = _cubic_resample(sa, L)                                      # (L, 6)
-                sa_t = torch.as_tensor(sa_L.T, device=device).unsqueeze(0) / sa_scale  # (1, 6, L)
-
-                latent = model.encoder(sa_t).squeeze(0).cpu().numpy().astype(np.float32)
+                if representation == "single_wing":
+                    # Encode left (cols 0:3) and right (cols 3:6) wings independently
+                    # through the shared single-wing encoder → (z_L, z_R) targets.
+                    wing_left_norm,  z_left  = _encode_single_wing(wing_segment[:, 0:3])
+                    wing_right_norm, z_right = _encode_single_wing(wing_segment[:, 3:6])
+                    latents_left_list.append(z_left)
+                    latents_right_list.append(z_right)
+                    wing_left_list.append(wing_left_norm)
+                    wing_right_list.append(wing_right_norm)
+                else:
+                    # Build the same input the encoder was trained on: SA at native length,
+                    # CubicSpline-resampled to L, transposed to (6, L), divided by SA_PHYSICAL_SCALE.
+                    sa = _segment_to_sa(wing_segment, template)                   # (n, 6)
+                    sa_L = _cubic_resample(sa, L)                                  # (L, 6)
+                    sa_t = torch.as_tensor(sa_L.T, device=device).unsqueeze(0) / sa_scale  # (1, 6, L)
+                    latent = model.encoder(sa_t).squeeze(0).cpu().numpy().astype(np.float32)
+                    target_latents_list.append(latent)
+                    # Store the exact (6, L) normalized SA the encoder consumed, so the
+                    # evaluator can compute decode(latent)-vs-ground-truth without having
+                    # to re-derive the wingbeat by position from wingbeats_L<L>.npz.
+                    sa_wingbeats_list.append(sa_t.squeeze(0).cpu().numpy().astype(np.float32))
 
                 body_means_list.append(body_mean)
                 next_body_means_list.append(next_body_mean)
-                target_latents_list.append(latent)
-                # Store the exact (6, L) normalized SA the encoder consumed, so the
-                # evaluator can compute decode(latent)-vs-ground-truth without having
-                # to re-derive the wingbeat by position from wingbeats_L<L>.npz (whose
-                # filtering/skip logic differs and silently misaligns the rows).
-                sa_wingbeats_list.append(sa_t.squeeze(0).cpu().numpy().astype(np.float32))
                 durations_list.append(duration)
                 trajectory_ids_list.append(traj_id)
 
@@ -284,8 +323,6 @@ def build_regressor_dataset(
 
     body_means      = np.stack(body_means_list)                         # (N, 12) float32
     next_body_means = np.stack(next_body_means_list)                    # (N, 12) float32
-    target_latents  = np.stack(target_latents_list)                     # (N, D)  float32
-    sa_wingbeats    = np.stack(sa_wingbeats_list)                       # (N, 6, L) float32
     durations       = np.asarray(durations_list, dtype=np.int32)        # (N,)
     trajectory_ids  = np.asarray(trajectory_ids_list, dtype=np.int32)   # (N,)
 
@@ -293,17 +330,14 @@ def build_regressor_dataset(
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    np.savez(
-        output,
-        body_means      = body_means,
-        next_body_means = next_body_means,
-        target_latents  = target_latents,
-        sa_wingbeats    = sa_wingbeats,
-        durations       = durations,
-        trajectory_ids  = trajectory_ids,
-    )
-
+    save_arrays = {
+        "body_means":      body_means,
+        "next_body_means": next_body_means,
+        "durations":       durations,
+        "trajectory_ids":  trajectory_ids,
+    }
     meta = {
+        "representation":        representation,
         "n_wingbeats":           int(len(body_means)),
         "n_trajectories":        int(n_traj),
         "n_dropped_last":        int(n_dropped_last),
@@ -312,7 +346,6 @@ def build_regressor_dataset(
         "autoencoder_output_len": int(L),
         "L":                     int(L),
         "has_next_body_mean":    True,
-        "has_sa_wingbeats":      True,
         "duration_min":          int(durations.min()),
         "duration_max":          int(durations.max()),
         "duration_mean":         float(durations.mean()),
@@ -321,21 +354,41 @@ def build_regressor_dataset(
         "processed_dir":         processed_dir,
         "template_path":         template_path,
         "asymmetry_max_multiple": asymmetry_max_multiple,
-        "sa_scale":              SA_PHYSICAL_SCALE.tolist(),
     }
+
+    if representation == "single_wing":
+        target_latents_left  = np.stack(latents_left_list)              # (N, D)
+        target_latents_right = np.stack(latents_right_list)             # (N, D)
+        single_wing_left     = np.stack(wing_left_list)                 # (N, 3, L)
+        single_wing_right    = np.stack(wing_right_list)                # (N, 3, L)
+        save_arrays.update(
+            target_latents_left  = target_latents_left,
+            target_latents_right = target_latents_right,
+            single_wing_left     = single_wing_left,
+            single_wing_right    = single_wing_right,
+        )
+        meta.update(
+            has_two_wing_latents = True,
+            has_single_wing_gt   = True,
+            sa_scale             = SINGLE_WING_PHYSICAL_SCALE.tolist(),
+        )
+    else:
+        target_latents = np.stack(target_latents_list)                  # (N, D)
+        sa_wingbeats   = np.stack(sa_wingbeats_list)                    # (N, 6, L)
+        save_arrays.update(target_latents=target_latents, sa_wingbeats=sa_wingbeats)
+        meta.update(has_sa_wingbeats=True, sa_scale=SA_PHYSICAL_SCALE.tolist())
+
+    np.savez(output, **save_arrays)
+
     meta_path = os.path.splitext(output)[0] + ".json"
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
     print()
-    print(f"Saved {len(body_means)} wingbeats to {output}")
-    print(f"  body_means:      {body_means.shape}  {body_means.dtype}")
-    print(f"  next_body_means: {next_body_means.shape}  {next_body_means.dtype}")
-    print(f"  target_latents: {target_latents.shape}  {target_latents.dtype}")
-    print(f"  sa_wingbeats:   {sa_wingbeats.shape}  {sa_wingbeats.dtype}")
-    print(f"  durations:      {durations.shape}  range [{durations.min()}, {durations.max()}]  "
-          f"mean {durations.mean():.2f}  std {durations.std():.2f}")
-    print(f"  trajectory_ids: {trajectory_ids.shape}  ({len(np.unique(trajectory_ids))} unique)")
+    print(f"Saved {len(body_means)} wingbeats to {output}  (representation={representation})")
+    for k, v in save_arrays.items():
+        print(f"  {k}: {v.shape}  {v.dtype}")
+    print(f"  trajectory_ids unique: {len(np.unique(trajectory_ids))}")
     print(f"Metadata: {meta_path}")
 
     return meta

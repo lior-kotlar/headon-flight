@@ -97,6 +97,12 @@ _R_PHI = 3
 # Order: [S_phi, S_theta, S_psi, A_phi, A_theta, A_psi]
 SA_PHYSICAL_SCALE = np.array([np.pi, 0.5, np.pi, np.pi, 0.5, np.pi], dtype=np.float32)
 
+# Per-channel divisors for the single-wing residual representation [phi, theta, psi].
+# Same physical bounds as one half of SA_PHYSICAL_SCALE — a single wing's residual is
+# in raw-angle units (not the L±R combination), so stroke φ / rotation ψ scale by π and
+# deviation θ by 0.5 rad, identical to the per-angle scale used for L/R reporting.
+SINGLE_WING_PHYSICAL_SCALE = np.array([np.pi, 0.5, np.pi], dtype=np.float32)
+
 
 def trajectory_asymmetry_score(traj: np.ndarray) -> float:
     """
@@ -157,6 +163,34 @@ def _sa_to_segment(sa: np.ndarray, template: np.ndarray) -> np.ndarray:
     A = sa[:, 3:]
     hat = np.concatenate([S + A, S - A], axis=1)
     return (hat + matched).astype(np.float32)
+
+
+def _segment_to_single_wing(wing: np.ndarray, template3: np.ndarray) -> np.ndarray:
+    """
+    Converts one single-wing segment (n, 3) [phi, theta, psi] to its residual
+    against the phase-matched single-wing template: residual = wing - matched.
+
+    `template3` is the (template_res, 3) single-wing golden template. The same
+    phase-matching (cubic interp onto the segment's normalized phase grid) used
+    by _segment_to_sa is applied here.
+    """
+    n = wing.shape[0]
+    phase_template = np.linspace(0, 1, template3.shape[0])
+    phase_segment  = np.linspace(0, 1, n)
+    matched = interp1d(phase_template, template3, axis=0, kind='cubic')(phase_segment)
+    return (wing - matched).astype(np.float32)
+
+
+def _single_wing_to_segment(residual: np.ndarray, template3: np.ndarray) -> np.ndarray:
+    """
+    Inverse of _segment_to_single_wing: wing angles = residual + matched template.
+    `residual` is (n, 3); returns (n, 3) [phi, theta, psi].
+    """
+    n = residual.shape[0]
+    phase_template = np.linspace(0, 1, template3.shape[0])
+    phase_segment  = np.linspace(0, 1, n)
+    matched = interp1d(phase_template, template3, axis=0, kind='cubic')(phase_segment)
+    return (residual + matched).astype(np.float32)
 
 
 def verify_sa_transform(
@@ -306,6 +340,68 @@ def generate_average_wingbeat_template(trajectories, template_res=100, plot_temp
     return template
 
 
+def generate_single_wing_template(trajectories, template_res=69, plot_template=True,
+                                  save_path="data/analysis/golden_template_single_wing.png"):
+    """
+    Build a single-wing golden template (template_res, 3) [phi, theta, psi] by pooling
+    every wingbeat's LEFT wing (cols 0:3) and RIGHT wing (cols 3:6) as independent
+    single-wing cycles and averaging on a normalized [0, 1] phase grid.
+
+    Left and right wing angles are stored in the same sign convention (the 6-channel
+    golden template's L/R curves nearly overlap), so the two wings are directly poolable.
+    Mirrors generate_average_wingbeat_template's cycle-collection loop.
+    """
+    all_cycles = []
+    phase_grid = np.linspace(0, 1, template_res)
+
+    for traj in trajectories:
+        peaks = _wingbeat_peaks(traj)
+        for i in range(len(peaks) - 1):
+            start, end = peaks[i], peaks[i + 1]
+            segment = traj[start:end, :]                 # (n, 6)
+            n = segment.shape[0]
+            if n < 2:
+                continue
+            relative_time = np.linspace(0, 1, n)
+            for cols in (slice(0, 3), slice(3, 6)):      # left wing, then right wing
+                wing = segment[:, cols]                  # (n, 3)
+                f = interp1d(relative_time, wing, axis=0, kind='cubic')
+                all_cycles.append(f(phase_grid))
+
+    all_cycles_arr = np.stack(all_cycles, axis=0)        # (2 * n_cycles, template_res, 3)
+    template3 = all_cycles_arr.mean(axis=0).astype(np.float32)
+    template3_std = all_cycles_arr.std(axis=0).astype(np.float32)
+
+    if plot_template:
+        phase = phase_grid
+        fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+        fig.suptitle(
+            f"Single-Wing 'Golden' Hover Template (n_cycles={len(all_cycles)}, shaded = ±1 std)",
+            fontsize=14,
+        )
+        labels = ['Stroke φ [rad]', 'Deviation θ [rad]', 'Rotation ψ [rad]']
+        for ax, k, label in zip(axes, range(3), labels):
+            ax.plot(phase, template3[:, k], color='purple', linewidth=2, label='single-wing mean')
+            ax.fill_between(
+                phase,
+                template3[:, k] - template3_std[:, k],
+                template3[:, k] + template3_std[:, k],
+                color='purple', alpha=0.2, linewidth=0,
+            )
+            ax.set_ylabel(label)
+            ax.legend(loc="upper right")
+            ax.grid(True, alpha=0.5)
+        axes[2].set_xlabel('Normalized Phase [0.0 - 1.0]')
+        plt.tight_layout()
+        if save_path:
+            os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Single-wing template plot saved to: {save_path}")
+        plt.close(fig)
+
+    return template3
+
+
 def transform_to_symmetric_asymmetric(trajectories, template, stroke_idx=0):
     """
     Transforms continuous wing angle trajectories into Symmetric (S) and Asymmetric (A) components.
@@ -416,12 +512,29 @@ def _cubic_resample(arr: np.ndarray, L: int) -> np.ndarray:
     return cs(x_new).astype(np.float32)
 
 
-def fixed_len_dataset_path(data_dir: str, L: int) -> str:
-    return os.path.join(data_dir, f"wingbeats_L{L}.npz")
+def _repr_tag(representation: str) -> str:
+    """Filename infix distinguishing representation variants. 'sa' (default) is empty
+    so existing wingbeats_L<L>.npz paths are unchanged; 'single_wing' tags the file."""
+    if representation == "sa":
+        return ""
+    if representation == "single_wing":
+        return "single_wing_"
+    raise ValueError(f"Unknown representation {representation!r}. Options: sa, single_wing.")
 
 
-def fixed_len_sidecar_path(data_dir: str, L: int) -> str:
-    return os.path.join(data_dir, f"wingbeats_L{L}.json")
+def fixed_len_dataset_path(data_dir: str, L: int, representation: str = "sa") -> str:
+    return os.path.join(data_dir, f"wingbeats_{_repr_tag(representation)}L{L}.npz")
+
+
+def fixed_len_sidecar_path(data_dir: str, L: int, representation: str = "sa") -> str:
+    return os.path.join(data_dir, f"wingbeats_{_repr_tag(representation)}L{L}.json")
+
+
+def single_wing_template_path(template_path: str) -> str:
+    """Sibling path of the 6-ch golden template holding the single-wing (3-ch) template,
+    e.g. data/analysis/golden_template.npy → data/analysis/golden_template_single_wing.npy."""
+    root, ext = os.path.splitext(template_path)
+    return f"{root}_single_wing{ext or '.npy'}"
 
 
 def body_kinematics_path(data_dir: str) -> str:
@@ -574,12 +687,178 @@ def build_fixed_len_dataset(
     return sidecar
 
 
+def build_single_wing_fixed_len_dataset(
+    L: int,
+    trajectories: list,
+    body_trajectories: list,
+    template3: np.ndarray,
+    output_path: str,
+    *,
+    trajectories_path: str = "",
+    body_kinematics_path_str: str = "",
+    template_path: str = "",
+    use_radians: bool = True,
+    asymmetry_max_multiple: float | None = None,
+    maneuver_W: int = 4,
+    maneuver_T_coh: float = 0.75,
+    maneuver_T_mag_percentile: float = 75.0,
+) -> dict:
+    """
+    Build the single-wing fixed-length dataset and its sidecar JSON.
+
+    Every wingbeat contributes TWO samples — its LEFT wing (cols 0:3) and its
+    RIGHT wing (cols 3:6). Each single-wing segment is residual-transformed
+    against the single-wing template at native length, normalized by
+    SINGLE_WING_PHYSICAL_SCALE, CubicSpline-resampled to length L, and stored
+    channels-first as (3, L) for the 3-channel encoder. So N wingbeats yield 2N
+    single-wing samples.
+
+    body_means and maneuver_scores are computed once per wingbeat (the body state
+    is shared by both wings) and duplicated across the left/right rows so every
+    array is aligned at the 2N sample level. Atomic write, same as the 6-ch builder.
+    """
+    if len(body_trajectories) != len(trajectories):
+        raise ValueError(
+            f"body/wing trajectory count mismatch: {len(body_trajectories)} vs {len(trajectories)}"
+        )
+
+    wing_samples:    list[np.ndarray] = []   # (3, L) per single wing
+    wing_side:       list[int]        = []   # 0 = left, 1 = right
+    body_means_wb:   list[np.ndarray] = []   # (12,) per wingbeat (N-level)
+    durations_wb:    list[int]        = []   # N-level
+    trajectory_wb:   list[int]        = []   # N-level
+    n_skipped = 0
+
+    for traj_id, (traj, body) in enumerate(zip(trajectories, body_trajectories)):
+        if body.shape[0] != traj.shape[0]:
+            raise ValueError(
+                f"trajectory {traj_id}: body length {body.shape[0]} ≠ wing length {traj.shape[0]}"
+            )
+        peaks = _wingbeat_peaks(traj)
+        for i in range(len(peaks) - 1):
+            start, end = int(peaks[i]), int(peaks[i + 1])
+            n = end - start
+            if n <= 1:
+                n_skipped += 1
+                continue
+            segment = traj[start:end]                                   # (n, 6)
+            for side, cols in enumerate((slice(0, 3), slice(3, 6))):    # left, then right
+                res_native = _segment_to_single_wing(segment[:, cols], template3)   # (n, 3)
+                res_L      = _cubic_resample(res_native, L)                          # (L, 3)
+                res_L_norm = res_L / SINGLE_WING_PHYSICAL_SCALE                      # (L, 3)
+                wing_samples.append(res_L_norm.T.astype(np.float32))                # (3, L)
+                wing_side.append(side)
+            body_means_wb.append(body[start:end].mean(axis=0).astype(np.float32))
+            durations_wb.append(n)
+            trajectory_wb.append(traj_id)
+
+    if not wing_samples:
+        raise RuntimeError("No wingbeats produced — check trajectories input.")
+
+    # 2N sample-level arrays. Each wingbeat appended left then right, so np.repeat(·, 2)
+    # of the N-level arrays aligns body/duration/trajectory/maneuver with the L/R rows.
+    sw_arr   = np.stack(wing_samples)                                    # (2N, 3, L)
+    side_arr = np.asarray(wing_side, dtype=np.int8)                     # (2N,)
+    bm_wb    = np.stack(body_means_wb)                                   # (N, 12)
+    dur_wb   = np.asarray(durations_wb,  dtype=np.int32)               # (N,)
+    tid_wb   = np.asarray(trajectory_wb, dtype=np.int32)               # (N,)
+
+    bm_arr   = np.repeat(bm_wb,  2, axis=0)                              # (2N, 12)
+    dur_arr  = np.repeat(dur_wb, 2, axis=0)                              # (2N,)
+    tid_arr  = np.repeat(tid_wb, 2, axis=0)                              # (2N,)
+
+    # --- Maneuver scoring at the wingbeat level, then duplicated per wing ---
+    from data_handling.maneuver_scoring import compute_maneuver_scores  # local import; no cycle
+    maneuver_scores_wb, maneuver_meta = compute_maneuver_scores(
+        mean_alpha       = bm_wb[:, _BODY_ALPHA_COLS],
+        trajectory_ids   = tid_wb,
+        W                = maneuver_W,
+        T_coh            = maneuver_T_coh,
+        T_mag_percentile = maneuver_T_mag_percentile,
+    )
+    maneuver_scores = np.repeat(maneuver_scores_wb, 2, axis=0)
+
+    sidecar = {
+        "schema_version":         _FIXED_LEN_SCHEMA_VERSION,
+        "representation":         "single_wing",
+        "L":                      int(L),
+        "interpolation":          _FIXED_LEN_INTERP_METHOD,
+        "single_wing_physical_scale": SINGLE_WING_PHYSICAL_SCALE.tolist(),
+        "use_radians":            bool(use_radians),
+        "asymmetry_max_multiple": asymmetry_max_multiple,
+        "n_samples":              int(sw_arr.shape[0]),
+        "n_wingbeats":            int(bm_wb.shape[0]),
+        "n_trajectories":         int(len(trajectories)),
+        "duration_min":           int(dur_wb.min()),
+        "duration_max":           int(dur_wb.max()),
+        "duration_mean":          float(dur_wb.mean()),
+        "duration_std":           float(dur_wb.std()),
+        "n_skipped":              int(n_skipped),
+        "trajectories_path":      trajectories_path,
+        "trajectories_md5":       _file_md5(trajectories_path),
+        "body_kinematics_path":   body_kinematics_path_str,
+        "body_kinematics_md5":    _file_md5(body_kinematics_path_str),
+        "template_path":          template_path,
+        "template_md5":           _file_md5(template_path),
+        "built_at":               datetime.now().isoformat(timespec="seconds"),
+        **maneuver_meta,
+    }
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    tmp_path = output_path[:-len(".npz")] + ".tmp.npz" if output_path.endswith(".npz") else output_path + ".tmp.npz"
+    np.savez(
+        tmp_path,
+        single_wing_wingbeats = sw_arr,
+        wing_side             = side_arr,
+        body_means            = bm_arr,
+        maneuver_scores       = maneuver_scores,
+        durations             = dur_arr,
+        trajectory_ids        = tid_arr,
+    )
+    os.replace(tmp_path, output_path)
+
+    sidecar_path = os.path.splitext(output_path)[0] + ".json"
+    tmp_sidecar  = sidecar_path + ".tmp"
+    with open(tmp_sidecar, "w") as f:
+        json.dump(sidecar, f, indent=2)
+    os.replace(tmp_sidecar, sidecar_path)
+
+    logger.info(
+        f"Single-wing fixed-length dataset (L={L}): {sw_arr.shape[0]} single wings from "
+        f"{bm_wb.shape[0]} wingbeats / {len(trajectories)} trajectories → {output_path}"
+    )
+    if n_skipped:
+        logger.warning(f"  Skipped {n_skipped} wingbeats with non-positive duration.")
+    return sidecar
+
+
+def ensure_single_wing_template(
+    template_path: str,
+    trajectories: list,
+    template_res: int = 69,
+) -> np.ndarray:
+    """Load the single-wing template sibling of `template_path`, building it from
+    `trajectories` (and saving it next to the 6-ch template) if it doesn't exist."""
+    sw_path = single_wing_template_path(template_path)
+    if os.path.exists(sw_path):
+        return np.load(sw_path)
+    logger.info(f"Single-wing template missing — building → {sw_path}")
+    plot_path = os.path.splitext(sw_path)[0] + ".png"
+    template3 = generate_single_wing_template(
+        trajectories, template_res=template_res, plot_template=True, save_path=plot_path,
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(sw_path)), exist_ok=True)
+    np.save(sw_path, template3)
+    return template3
+
+
 def build_fixed_len_dataset_from_disk(
     L: int,
     trajectories_path: str,
     template_path: str,
     output_path: str,
     *,
+    representation: str = "sa",
     body_kinematics_path_str: str | None = None,
     use_radians: bool = True,
     asymmetry_max_multiple: float | None = None,
@@ -589,7 +868,11 @@ def build_fixed_len_dataset_from_disk(
 ) -> dict:
     """
     Convenience wrapper that loads trajectories + body kinematics + template
-    from disk and builds the fixed-length dataset.
+    from disk and builds the fixed-length dataset for the given representation.
+
+    representation="sa" builds the 6-channel S/A dataset against `template_path`.
+    representation="single_wing" builds the 3-channel single-wing dataset against
+    the single-wing template sibling of `template_path` (built on demand if missing).
 
     If body_kinematics_path_str is None, the loader derives it from
     trajectories_path by convention (body_kinematics.npy in the same directory).
@@ -607,7 +890,27 @@ def build_fixed_len_dataset_from_disk(
         )
     trajectories      = np.load(trajectories_path,        allow_pickle=True).tolist()
     body_trajectories = np.load(body_kinematics_path_str, allow_pickle=True).tolist()
-    template          = np.load(template_path)
+
+    if representation == "single_wing":
+        template3       = ensure_single_wing_template(template_path, trajectories)
+        sw_template_path = single_wing_template_path(template_path)
+        return build_single_wing_fixed_len_dataset(
+            L                          = L,
+            trajectories               = trajectories,
+            body_trajectories          = body_trajectories,
+            template3                  = template3,
+            output_path                = output_path,
+            trajectories_path          = trajectories_path,
+            body_kinematics_path_str   = body_kinematics_path_str,
+            template_path              = sw_template_path,
+            use_radians                = use_radians,
+            asymmetry_max_multiple     = asymmetry_max_multiple,
+            maneuver_W                 = maneuver_W,
+            maneuver_T_coh             = maneuver_T_coh,
+            maneuver_T_mag_percentile  = maneuver_T_mag_percentile,
+        )
+
+    template = np.load(template_path)
     return build_fixed_len_dataset(
         L                          = L,
         trajectories               = trajectories,
@@ -632,6 +935,7 @@ def fixed_len_dataset_is_valid(
     L: int,
     trajectories_path: str,
     template_path: str,
+    representation: str = "sa",
     body_kinematics_path_str: str | None = None,
     maneuver_W: int | None = None,
     maneuver_T_coh: float | None = None,
@@ -640,6 +944,9 @@ def fixed_len_dataset_is_valid(
     """
     Returns (is_valid, reason). is_valid=True means the on-disk dataset can be loaded
     as-is; False means it's missing or stale and the caller should rebuild.
+
+    `template_path` is the 6-ch golden template path; for representation="single_wing"
+    the single-wing template sibling is the one whose md5 is checked.
 
     Maneuver params (W / T_coh / T_mag_percentile) are checked against the sidecar
     only when the caller passes a non-None value. This lets autoencoder configs
@@ -656,9 +963,14 @@ def fixed_len_dataset_is_valid(
         return False, f"corrupt sidecar: {e}"
     if meta.get("schema_version") != _FIXED_LEN_SCHEMA_VERSION:
         return False, f"schema_version mismatch ({meta.get('schema_version')} ≠ {_FIXED_LEN_SCHEMA_VERSION})"
+    if meta.get("representation", "sa") != representation:
+        return False, f"representation mismatch ({meta.get('representation', 'sa')} ≠ {representation})"
     if int(meta.get("L", -1)) != int(L):
         return False, f"L mismatch ({meta.get('L')} ≠ {L})"
-    if meta.get("template_md5") != _file_md5(template_path):
+    template_md5_path = (
+        single_wing_template_path(template_path) if representation == "single_wing" else template_path
+    )
+    if meta.get("template_md5") != _file_md5(template_md5_path):
         return False, "template file changed since build"
     if meta.get("trajectories_md5") != _file_md5(trajectories_path):
         return False, "trajectories file changed since build"
@@ -726,6 +1038,15 @@ def main() -> None:
         help="If > 0, additionally build wingbeats_L<fixed_len>.npz — every wingbeat's "
              "SA representation CubicSpline-resampled to this many samples. The variable-length "
              "trajectories.npy and template are still produced. Default: 0 (no fixed-length file).",
+    )
+    parser.add_argument(
+        "--single_wing_fixed_len",
+        type=int,
+        default=0,
+        help="If > 0, additionally build the single-wing dataset wingbeats_single_wing_L<N>.npz — "
+             "every wingbeat split into its left and right wing (3 channels each), residual against "
+             "the single-wing template, CubicSpline-resampled to this many samples. Also builds "
+             "golden_template_single_wing.npy. Default: 0 (not built).",
     )
     parser.add_argument(
         "--maneuver_W", type=int, default=4,
@@ -826,6 +1147,38 @@ def main() -> None:
             trajectories_path          = data_path,
             body_kinematics_path_str   = body_path,
             template_path              = template_path,
+            use_radians                = not args.no_radians,
+            asymmetry_max_multiple     = args.asymmetry_max_multiple,
+            maneuver_W                 = args.maneuver_W,
+            maneuver_T_coh             = args.maneuver_T_coh,
+            maneuver_T_mag_percentile  = args.maneuver_T_mag_percentile,
+        )
+
+    # --- Optionally build the single-wing dataset (one wing at a time, 3 channels) ---
+    if args.single_wing_fixed_len and args.single_wing_fixed_len > 0:
+        L = int(args.single_wing_fixed_len)
+        data_dir = os.path.dirname(os.path.abspath(data_path))
+        sw_template_path = single_wing_template_path(template_path)
+        template3 = generate_single_wing_template(
+            trajectories  = trajectories,
+            template_res  = args.template_res,
+            plot_template = not args.no_plot,
+            save_path     = (os.path.splitext(sw_template_path)[0] + ".png") if not args.no_plot else None,
+        )
+        np.save(sw_template_path, template3)
+        logger.info(f"Saved single-wing template {template3.shape} → {sw_template_path}")
+
+        out_path = fixed_len_dataset_path(data_dir, L, representation="single_wing")
+        logger.info(f"Building single-wing fixed-length dataset (L={L}) → {out_path}")
+        build_single_wing_fixed_len_dataset(
+            L                          = L,
+            trajectories               = trajectories,
+            body_trajectories          = body_trajectories,
+            template3                  = template3,
+            output_path                = out_path,
+            trajectories_path          = data_path,
+            body_kinematics_path_str   = body_path,
+            template_path              = sw_template_path,
             use_radians                = not args.no_radians,
             asymmetry_max_multiple     = args.asymmetry_max_multiple,
             maneuver_W                 = args.maneuver_W,

@@ -56,7 +56,14 @@ _COMPLEX_VALUE_KEYS = {"hidden_dims", "body_feature_indices"}
 
 
 class BodyLatentRegressor(nn.Module):
-    """MLP: scaled (body_mean, next_body_mean) (24,) → (latent (D,), standardized log-duration (1,))."""
+    """MLP: scaled (body_mean, next_body_mean) → (latent, standardized log-duration).
+
+    `n_wings` controls how many wingbeat latents are predicted from the shared trunk:
+      * n_wings=1 (default, 'sa' representation): latent is (B, D), exactly the original
+        behavior. The latent_head is Linear(prev, D), so old checkpoints load unchanged.
+      * n_wings=2 ('single_wing'): the head emits 2·D and is reshaped to (B, 2, D) —
+        z_L and z_R, both decoded by the one shared single-wing decoder downstream.
+    """
     def __init__(
         self,
         in_dim: int = 24,
@@ -64,6 +71,7 @@ class BodyLatentRegressor(nn.Module):
         hidden_dims=(128, 128),
         activation: str = "gelu",
         dropout: float = 0.1,
+        n_wings: int = 1,
     ):
         super().__init__()
         act_cls = _ACTIVATIONS[activation.lower()]
@@ -76,28 +84,50 @@ class BodyLatentRegressor(nn.Module):
                 layers.append(nn.Dropout(dropout))
             prev = h
         self.trunk         = nn.Sequential(*layers)
-        self.latent_head   = nn.Linear(prev, latent_dim)
+        self.latent_head   = nn.Linear(prev, n_wings * latent_dim)
         self.duration_head = nn.Linear(prev, 1)
 
         self.in_dim      = in_dim
         self.latent_dim  = latent_dim
+        self.n_wings     = n_wings
         self.hidden_dims = list(hidden_dims)
         self.activation  = activation
         self.dropout     = dropout
 
     def forward(self, body_scaled: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.trunk(body_scaled)
-        return self.latent_head(h), self.duration_head(h).squeeze(-1)
+        latent = self.latent_head(h)
+        if self.n_wings > 1:
+            latent = latent.view(latent.size(0), self.n_wings, self.latent_dim)
+        duration = self.duration_head(h).squeeze(-1)
+        return latent, duration
 
 
 def _load_split(dataset_path: str, ae_val_indices_path: str) -> dict:
-    """Load the regressor dataset and mask wingbeats by autoencoder val trajectories."""
+    """Load the regressor dataset and mask wingbeats by autoencoder val trajectories.
+
+    Detects the representation from the npz contents: a 'single_wing' dataset carries
+    target_latents_left/right (stacked into target_latents (N, 2, D), n_wings=2); a
+    legacy 'sa' dataset carries target_latents (N, D), n_wings=1.
+    """
     data = np.load(dataset_path)
     body_means      = data["body_means"].astype(np.float32)
     next_body_means = data["next_body_means"].astype(np.float32)
-    target_latents  = data["target_latents"].astype(np.float32)
     durations       = data["durations"].astype(np.int32)
     traj_ids        = data["trajectory_ids"].astype(np.int32)
+
+    two_wing = "target_latents_left" in data.files
+    if two_wing:
+        # (N, 2, D): wing axis = [left, right].
+        target_latents = np.stack(
+            [data["target_latents_left"].astype(np.float32),
+             data["target_latents_right"].astype(np.float32)],
+            axis=1,
+        )
+        n_wings = 2
+    else:
+        target_latents = data["target_latents"].astype(np.float32)   # (N, D)
+        n_wings = 1
 
     with open(ae_val_indices_path) as f:
         meta = json.load(f)
@@ -108,16 +138,20 @@ def _load_split(dataset_path: str, ae_val_indices_path: str) -> dict:
         "body_means":      body_means,
         "next_body_means": next_body_means,
         "target_latents":  target_latents,
+        "n_wings":         n_wings,
         "durations":       durations,
         "trajectory_ids":  traj_ids,
         "train_idx":       np.where(~val_mask)[0],
         "val_idx":         np.where( val_mask)[0],
     }
-    # The exact (6, L) normalized SA fed to the encoder, when the dataset was
-    # built with it. Lets the evaluator use ground truth aligned 1:1 to each
-    # latent instead of re-deriving it by position from wingbeats_L<L>.npz.
+    # Ground-truth wing arrays aligned 1:1 to each latent, used by the evaluator to
+    # compute decode(latent)-vs-ground-truth without re-deriving wingbeats by position.
+    # 'sa': (N, 6, L) normalized SA; 'single_wing': (N, 3, L) left and right residuals.
     if "sa_wingbeats" in data.files:
         split["sa_wingbeats"] = data["sa_wingbeats"].astype(np.float32)
+    if "single_wing_left" in data.files:
+        split["single_wing_left"]  = data["single_wing_left"].astype(np.float32)
+        split["single_wing_right"] = data["single_wing_right"].astype(np.float32)
     return split
 
 
@@ -225,8 +259,11 @@ def _print_diagnostics(splits: dict, dataset_path: str, ae_model_dir: str) -> No
         _row(f"body[{i:>2d}] {name}",  body[tr, i],  body[vl, i])
     for i, name in enumerate(body_channel_names):
         _row(f"next[{i:>2d}] {name}",  nbody[tr, i], nbody[vl, i])
-    for i in range(lat.shape[1]):
-        _row(f"latent[{i:>2d}]", lat[tr, i], lat[vl, i])
+    # Latent may be (N, D) ('sa') or (N, n_wings, D) ('single_wing'); flatten the
+    # per-wingbeat latent for the per-dim distribution-shift readout.
+    lat_flat = lat.reshape(lat.shape[0], -1)
+    for i in range(lat_flat.shape[1]):
+        _row(f"latent[{i:>2d}]", lat_flat[tr, i], lat_flat[vl, i])
     log_dur = np.log(dur)
     _row("duration (samples)", dur[tr], dur[vl])
     _row("log_duration",       log_dur[tr], log_dur[vl])
@@ -286,23 +323,26 @@ def _resolve_ae_model_dir(model_dir: str) -> str:
     return latest
 
 
-def _read_ae_dims(ae_model_dir: str) -> tuple[int, int]:
-    """The (latent_dim, output_len) the autoencoder at ae_model_dir produces — these
-    fix the regressor dataset's target shape and wingbeat length. Read from
+def _read_ae_dims(ae_model_dir: str) -> tuple[int, int, str]:
+    """The (latent_dim, output_len, representation) the autoencoder at ae_model_dir
+    produces — these fix the regressor dataset's target shape, wingbeat length, and
+    which representation (and thus how many wing latents) it carries. Read from
     best_config.json (cheap); fall back to the checkpoint if a key is absent."""
-    latent_dim = L = None
+    latent_dim = L = representation = None
     cfg_path = os.path.join(ae_model_dir, "best_config.json")
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
             c = json.load(f)
-        latent_dim = c.get("latent_dim")
-        L          = c.get("fixed_len", c.get("output_len"))
-    if latent_dim is None or L is None:
+        latent_dim     = c.get("latent_dim")
+        L              = c.get("fixed_len", c.get("output_len"))
+        representation = c.get("representation")
+    if latent_dim is None or L is None or representation is None:
         ckpt = torch.load(os.path.join(ae_model_dir, "best_autoencoder.pt"),
                           map_location="cpu", weights_only=False)
-        latent_dim = ckpt["latent_dim"]
-        L          = ckpt["output_len"]
-    return int(latent_dim), int(L)
+        latent_dim     = ckpt["latent_dim"]     if latent_dim is None else latent_dim
+        L              = ckpt["output_len"]      if L is None else L
+        representation = ckpt.get("representation", "sa") if representation is None else representation
+    return int(latent_dim), int(L), str(representation)
 
 
 def _resolve_dataset_path(fixed: dict, ae_model_dir: str, device: str) -> str:
@@ -326,12 +366,13 @@ def _resolve_dataset_path(fixed: dict, ae_model_dir: str, device: str) -> str:
         regressor_dataset_is_valid,
     )
 
-    latent_dim, L = _read_ae_dims(ae_model_dir)
+    latent_dim, L, representation = _read_ae_dims(ae_model_dir)
     data_dir = fixed.get("data_dir", "data")
-    path     = regressor_dataset_path(data_dir, latent_dim, L)
-    sidecar  = regressor_dataset_sidecar_path(data_dir, latent_dim, L)
+    path     = regressor_dataset_path(data_dir, latent_dim, L, representation)
+    sidecar  = regressor_dataset_sidecar_path(data_dir, latent_dim, L, representation)
     is_valid, reason = regressor_dataset_is_valid(
-        path, sidecar, latent_dim=latent_dim, L=L, autoencoder_model_dir=ae_model_dir,
+        path, sidecar, latent_dim=latent_dim, L=L,
+        autoencoder_model_dir=ae_model_dir, representation=representation,
     )
     if is_valid:
         print(f"Regressor dataset: {path}  (latent_dim={latent_dim}, L={L})")
@@ -385,7 +426,8 @@ def train_one(
     next_body_means = splits["next_body_means"]
     target_latents  = splits["target_latents"]
     durations       = splits["durations"]
-    inferred_latent_dim = target_latents.shape[1]
+    n_wings             = int(splits["n_wings"])
+    inferred_latent_dim = target_latents.shape[-1]
 
     # --- Feature selection + scaling. The dataset stores the full 12-d body means;
     # the regressor consumes a configurable subset (feature_set), applied identically
@@ -412,7 +454,8 @@ def train_one(
 
     print(f"  Train: {len(X_train)} wingbeats | Val: {len(X_val)} wingbeats")
     print(f"  Feature set: {feat_names} (indices {indices}) | scaler: {scaler_type}")
-    print(f"  Input dim: {X_train.shape[1]}  |  Latent dim (from dataset): {inferred_latent_dim}")
+    print(f"  Input dim: {X_train.shape[1]}  |  Latent dim (from dataset): {inferred_latent_dim}"
+          f"  |  n_wings: {n_wings}")
 
     # --- Model ---
     hidden_dims = config.get("hidden_dims", [128, 128])
@@ -422,6 +465,7 @@ def train_one(
         hidden_dims = hidden_dims,
         activation  = config.get("activation", "gelu"),
         dropout     = float(config.get("dropout", 0.1)),
+        n_wings     = n_wings,
     ).to(device)
 
     # --- Optimizer ---
@@ -540,6 +584,7 @@ def train_one(
         "body_scaler":          body_scaler,    # vector_norm or standardize; carries its own indices
         "duration_standardizer": {"mu": dur_mu, "sigma": dur_sigma, "space": "log"},
         "inferred_latent_dim":   int(inferred_latent_dim),
+        "n_wings":               int(n_wings),
         "in_dim":                int(X_train.shape[1]),
     }
     return summary, best_state
@@ -632,10 +677,14 @@ def main():
 
     # --- Persist the overall best checkpoint at the run dir root ---
     cfg = best_overall_config
+    n_wings_best   = int(best_overall_extras.get("n_wings", 1))
+    representation = "single_wing" if n_wings_best == 2 else "sa"
     ckpt = {
         "state_dict":            best_overall_state,
         "in_dim":                best_overall_extras["in_dim"],
         "latent_dim":            best_overall_extras["inferred_latent_dim"],
+        "n_wings":               n_wings_best,
+        "representation":        representation,
         "hidden_dims":           cfg.get("hidden_dims", [128, 128]),
         "activation":            cfg.get("activation", "gelu"),
         "dropout":               float(cfg.get("dropout", 0.1)),

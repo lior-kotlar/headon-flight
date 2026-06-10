@@ -27,17 +27,29 @@ import torch.nn as nn
 from autoencoder import WingbeatAutoencoder
 from body_latent_regressor import BodyLatentRegressor, _load_split
 from data_handling.body_features import scaler_to_offset_scale
-from transform_data import _cubic_resample
+from data_handling.bucket_eval import sa_to_lr_norm
+from transform_data import (
+    _cubic_resample,
+    _single_wing_to_segment,
+    SINGLE_WING_PHYSICAL_SCALE,
+    single_wing_template_path,
+)
 
 
 class BodyToWingbeat(nn.Module):
-    """Wraps a trained regressor + frozen decoder; outputs S/A wingbeats.
+    """Wraps a trained regressor + frozen decoder; composes a full wingbeat from body kinematics.
 
     The regressor consumes a configurable subset of the 12-d body-mean vector
     (body_feature_indices), selected identically from the CURRENT and NEXT
     wingbeat's mean body kinematics and scaled per-channel ((x - offset) / scale).
     Callers always pass the full 12-d body means; the selection happens here, so
     the same call site serves any feature set ("full" → 24-d, "pitch" → 4-d, ...).
+
+    Two representations:
+      * 'sa'          — regressor predicts one latent z; the frozen 6-ch decoder maps
+                        z → (B, 6, L) normalized S/A. (original behavior)
+      * 'single_wing' — regressor predicts (z_L, z_R); the ONE shared frozen 3-ch
+                        decoder maps each to (B, 3, L), stacked into a full wingbeat.
     """
     def __init__(
         self,
@@ -49,12 +61,24 @@ class BodyToWingbeat(nn.Module):
         dur_mu: float,
         dur_sigma: float,
         min_duration: int = 2,
+        representation: str = "sa",
+        template3: np.ndarray | None = None,
     ):
         super().__init__()
         self.regressor = regressor
         self.decoder   = autoencoder.decoder
         for p in self.decoder.parameters():
             p.requires_grad_(False)
+
+        self.representation = representation
+        self.n_wings        = int(getattr(regressor, "n_wings", 1))
+        # Single-wing template (template_res, 3) for raw-angle reconstruction in forward().
+        # Not needed for the L/R-normalized decode used by the evaluator (residuals cancel).
+        if template3 is not None:
+            self.register_buffer("template3", torch.from_numpy(np.asarray(template3, np.float32)))
+        else:
+            self.template3 = None
+        self.register_buffer("single_wing_scale", torch.from_numpy(SINGLE_WING_PHYSICAL_SCALE))
 
         # Selection + per-channel scaling, applied identically to each half.
         self.register_buffer("body_indices", body_indices.long())
@@ -76,8 +100,9 @@ class BodyToWingbeat(nn.Module):
         body_mean: torch.Tensor,
         next_body_mean: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Raw body kinematics → (latent (B, D), duration (B,) int).
+        """Raw body kinematics → (latent, duration (B,) int).
 
+        latent is (B, D) for 'sa' and (B, 2, D) for 'single_wing'.
         body_mean, next_body_mean: (B, 12) each.
         """
         x = self.scale_body(body_mean, next_body_mean)
@@ -86,19 +111,55 @@ class BodyToWingbeat(nn.Module):
         dur = torch.exp(log_dur).round().clamp(min=self.min_duration).long()
         return pred_l, dur
 
+    def decode_lr_norm(self, latent: torch.Tensor) -> torch.Tensor:
+        """Decode latent(s) into a full wingbeat in the per-angle-normalized L/R-residual
+        space [L_phi, L_theta, L_psi, R_phi, R_theta, R_psi] at fixed L — directly
+        comparable to the ground-truth stored by build_regressor_dataset.
+
+        'sa': sa_to_lr_norm(decoder(z)).  'single_wing': cat(decoder(z_L), decoder(z_R)),
+        whose channels already ARE the per-angle-normalized left/right residuals.
+        """
+        if self.representation == "single_wing":
+            z_l, z_r = latent[:, 0, :], latent[:, 1, :]
+            left  = self.decoder(z_l)                 # (B, 3, L) normalized left residual
+            right = self.decoder(z_r)                 # (B, 3, L) normalized right residual
+            return torch.cat([left, right], dim=1)    # (B, 6, L)
+        return sa_to_lr_norm(self.decoder(latent))    # (B, 6, L)
+
     def forward(
         self,
         body_mean: torch.Tensor,
         next_body_mean: torch.Tensor,
     ) -> list[torch.Tensor]:
-        """Decode at fixed L, then CubicSpline-resample each row to its predicted duration.
+        """Predict and decode a full wingbeat, then CubicSpline-resample each row to its
+        predicted duration. Returns a list of (T_i, 6) tensors (CPU); lengths vary so we
+        cannot stack. Torch has no 1D cubic interpolation, so resampling is done in numpy.
 
-        Returns a list of (T_i, 6) S/A tensors (CPU). Lengths vary by row, so we cannot stack.
-        The decoder always produces L samples; CubicSpline interpolation happens here in
-        numpy because torch's `F.interpolate` has no 1D cubic mode.
+        'sa' returns normalized S/A wingbeats (unchanged). 'single_wing' returns RAW
+        wing angles [L_phi..R_psi] (residual × scale + template), ready for inference.
         """
         latent, dur = self.predict_latent_and_duration(body_mean, next_body_mean)
-        wing_L = self.decoder(latent)                                # (B, 6, L), L = self.decoder.output_len
+
+        if self.representation == "single_wing":
+            z_l, z_r = latent[:, 0, :], latent[:, 1, :]
+            left_res  = (self.decoder(z_l) * self.single_wing_scale.view(1, 3, 1))   # (B,3,L) raw residual
+            right_res = (self.decoder(z_r) * self.single_wing_scale.view(1, 3, 1))
+            left_np   = left_res.transpose(1, 2).detach().cpu().numpy()              # (B, L, 3)
+            right_np  = right_res.transpose(1, 2).detach().cpu().numpy()
+            tmpl3     = self.template3.cpu().numpy() if self.template3 is not None else None
+            outputs = []
+            for i in range(left_np.shape[0]):
+                T_i = int(dur[i].item())
+                if tmpl3 is not None:
+                    left_ang  = _single_wing_to_segment(_cubic_resample(left_np[i],  T_i), tmpl3)
+                    right_ang = _single_wing_to_segment(_cubic_resample(right_np[i], T_i), tmpl3)
+                else:  # no template available → return residuals only
+                    left_ang  = _cubic_resample(left_np[i],  T_i)
+                    right_ang = _cubic_resample(right_np[i], T_i)
+                outputs.append(torch.from_numpy(np.concatenate([left_ang, right_ang], axis=1)))  # (T_i, 6)
+            return outputs
+
+        wing_L = self.decoder(latent)                                # (B, 6, L)
         wing_L_np = wing_L.transpose(1, 2).detach().cpu().numpy()    # (B, L, 6) for the resampler
         outputs = []
         for i in range(wing_L_np.shape[0]):
@@ -112,8 +173,14 @@ def load_body_to_wingbeat(
     regressor_ckpt_path: str,
     autoencoder_ckpt_path: str,
     device: str = "cpu",
+    template_path: str = "data/analysis/golden_template.npy",
 ) -> BodyToWingbeat:
-    """Load regressor and autoencoder checkpoints and wire them into a BodyToWingbeat."""
+    """Load regressor and autoencoder checkpoints and wire them into a BodyToWingbeat.
+
+    For a single-wing model the regressor is two-headed (n_wings=2) and the autoencoder
+    is 3-channel; the single-wing template (sibling of template_path) is loaded so
+    forward() can return raw wing angles. Both inferred from the checkpoints.
+    """
     r_ckpt = torch.load(regressor_ckpt_path, map_location=device, weights_only=False)
     regressor = BodyLatentRegressor(
         in_dim      = r_ckpt["in_dim"],
@@ -121,13 +188,16 @@ def load_body_to_wingbeat(
         hidden_dims = r_ckpt["hidden_dims"],
         activation  = r_ckpt["activation"],
         dropout     = r_ckpt["dropout"],
+        n_wings     = int(r_ckpt.get("n_wings", 1)),
     )
     regressor.load_state_dict(r_ckpt["state_dict"])
     regressor.to(device).eval()
 
     a_ckpt = torch.load(autoencoder_ckpt_path, map_location=device, weights_only=False)
+    representation = a_ckpt.get("representation", r_ckpt.get("representation", "sa"))
     ae = WingbeatAutoencoder(
         latent_dim          = a_ckpt["latent_dim"],
+        in_channels         = a_ckpt.get("in_channels", 6),
         activation          = a_ckpt.get("activation", "gelu"),
         dropout             = a_ckpt.get("dropout", 0.0),
         base_channels       = a_ckpt.get("base_channels", 128),
@@ -143,6 +213,14 @@ def load_body_to_wingbeat(
             f"latent_dim mismatch: regressor={regressor.latent_dim} ae={ae.latent_dim}"
         )
 
+    template3 = None
+    if representation == "single_wing":
+        sw_path = single_wing_template_path(template_path)
+        if os.path.exists(sw_path):
+            template3 = np.load(sw_path)
+        else:
+            print(f"  (single-wing template {sw_path} not found — forward() returns residuals)")
+
     # The body-scaler dict carries everything needed to reproduce selection +
     # scaling (both "vector_norm" full-input and "standardize" subset forms).
     indices, offset, scale = scaler_to_offset_scale(r_ckpt["body_scaler"])
@@ -156,6 +234,8 @@ def load_body_to_wingbeat(
         regressor, ae,
         body_indices.to(device), body_offset.to(device), body_scale.to(device),
         dur_mu, dur_sigma,
+        representation = representation,
+        template3      = template3,
     ).to(device)
 
 
