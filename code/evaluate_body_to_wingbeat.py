@@ -53,6 +53,7 @@ from body_to_wingbeat import (
     load_body_to_wingbeat,
 )
 from body_latent_regressor import _load_split
+from data_handling.body_features import BODY_CHANNEL_NAMES
 from data_handling.bucket_eval import (
     WING_ANGLE_LABELS,
     WING_ANGLE_SCALE,
@@ -683,6 +684,8 @@ def run_evaluation(
         "wingbeats_npz":    npz_path if npz_path and os.path.exists(npz_path) else None,
         "n_val":            int(n_val),
         "latent_dim":       int(pred_latents.shape[1]),
+        "body_feature_indices": [int(i) for i in bw.body_indices.tolist()],
+        "body_feature_names":   [BODY_CHANNEL_NAMES[int(i)] for i in bw.body_indices.tolist()],
         "retrieval": {
             "median_rank":       retrieval["median_rank"],
             "mean_rank":         retrieval["mean_rank"],

@@ -35,6 +35,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from normalizer import VectorNormScaler
+from data_handling.body_features import (
+    resolve_feature_set,
+    default_scaler_type,
+    apply_body_scaler_np,
+)
 
 
 _ACTIVATIONS = {
@@ -47,7 +52,7 @@ _ACTIVATIONS = {
 
 # Complex-valued config keys: a bare list-of-scalars is a single value;
 # only a list-of-lists is a grid axis. Matches the autoencoder convention.
-_COMPLEX_VALUE_KEYS = {"hidden_dims"}
+_COMPLEX_VALUE_KEYS = {"hidden_dims", "body_feature_indices"}
 
 
 class BodyLatentRegressor(nn.Module):
@@ -130,6 +135,41 @@ def _fit_vector_norm_scale(body_means_train: np.ndarray) -> np.ndarray:
     scaler = VectorNormScaler(global_normalizer=True)
     scaler.fit(torch.from_numpy(body_means_train))
     return scaler.scale_factors.squeeze(0).numpy().astype(np.float32)  # (12,)
+
+
+def _fit_body_scaler(body_means_train: np.ndarray, indices: list[int], scaler_type: str) -> dict:
+    """Fit a serializable body-scaler over the selected channels of the TRAIN
+    current-wingbeat body_means. The same scaler is reused for the next-wingbeat
+    half by the caller (see apply_body_scaler_np).
+
+    "vector_norm": divide each 3-vector by its mean L2 magnitude (original full-input
+        behavior; requires a feature count that is a multiple of 3).
+    "standardize": per-channel z-score (works for any subset).
+    """
+    sel = body_means_train[:, np.asarray(indices, dtype=np.int64)]
+    if scaler_type == "vector_norm":
+        if sel.shape[1] % 3 != 0:
+            raise ValueError(
+                f"body_scaler 'vector_norm' needs a feature count that is a multiple of 3; "
+                f"got {sel.shape[1]} ({list(indices)}). Use 'standardize' for this feature set."
+            )
+        scale = _fit_vector_norm_scale(sel)                              # (k,)
+        scaler = {"type": "vector_norm", "scale_factors": [float(v) for v in scale]}
+        # Legacy full-input checkpoints omit indices; only record them for subsets.
+        if list(indices) != list(range(body_means_train.shape[1])):
+            scaler["indices"] = [int(i) for i in indices]
+        return scaler
+    if scaler_type == "standardize":
+        mu = sel.mean(axis=0)
+        sd = sel.std(axis=0)
+        sd = np.where(sd > 1e-8, sd, 1.0)
+        return {
+            "type":    "standardize",
+            "indices": [int(i) for i in indices],
+            "mean":    [float(v) for v in mu],
+            "std":     [float(v) for v in sd],
+        }
+    raise ValueError(f"Unknown body_scaler {scaler_type!r}. Options: vector_norm, standardize.")
 
 
 def _make_loader(X, y_latent, y_dur, batch_size, shuffle):
@@ -347,14 +387,18 @@ def train_one(
     durations       = splits["durations"]
     inferred_latent_dim = target_latents.shape[1]
 
-    # --- VectorNormScaler: fit on TRAIN current-wingbeat body_means;
-    # reuse the same 12-d scale factors for both halves of the 24-d input. ---
-    scale_12 = _fit_vector_norm_scale(body_means[train_idx])              # (12,)
-    scale_24 = np.concatenate([scale_12, scale_12], axis=0)[None, :]      # (1, 24)
-
-    X_full = np.concatenate([body_means, next_body_means], axis=1)        # (N, 24)
-    X_train = (X_full[train_idx] / scale_24).astype(np.float32)
-    X_val   = (X_full[val_idx]   / scale_24).astype(np.float32)
+    # --- Feature selection + scaling. The dataset stores the full 12-d body means;
+    # the regressor consumes a configurable subset (feature_set), applied identically
+    # to the current and next halves. "full" + vector_norm reproduces the original
+    # 24-d input. The scaler is fit on the TRAIN current-wingbeat selected channels
+    # and reused for the next half (see apply_body_scaler_np). ---
+    indices, feat_names = resolve_feature_set(
+        config.get("feature_set"), config.get("body_feature_indices"),
+    )
+    scaler_type = config.get("body_scaler") or default_scaler_type(indices)
+    body_scaler = _fit_body_scaler(body_means[train_idx], indices, scaler_type)
+    X_train = apply_body_scaler_np(body_means[train_idx], next_body_means[train_idx], body_scaler)
+    X_val   = apply_body_scaler_np(body_means[val_idx],   next_body_means[val_idx],   body_scaler)
 
     # --- Duration is standardized in log-space (independent of body scaling) ---
     log_dur = np.log(durations.astype(np.float32))
@@ -367,6 +411,7 @@ def train_one(
     y_dur_val   = ((log_dur[val_idx]   - dur_mu) / dur_sigma).astype(np.float32)
 
     print(f"  Train: {len(X_train)} wingbeats | Val: {len(X_val)} wingbeats")
+    print(f"  Feature set: {feat_names} (indices {indices}) | scaler: {scaler_type}")
     print(f"  Input dim: {X_train.shape[1]}  |  Latent dim (from dataset): {inferred_latent_dim}")
 
     # --- Model ---
@@ -489,10 +534,10 @@ def train_one(
         "best_val_duration_mse": float(val_hist["duration"][best_epoch - 1]),
         "best_epoch":            int(best_epoch),
         "autoencoder_model_dir": ae_model_dir,
-        "body_scaler": {
-            "type":          "vector_norm",
-            "scale_factors": scale_12.tolist(),     # 12-d; apply to each half of the 24-d input
-        },
+        "feature_set":          config.get("feature_set") or ("full" if list(indices) == list(range(12)) else "custom"),
+        "body_feature_indices": [int(i) for i in indices],
+        "body_feature_names":   list(feat_names),
+        "body_scaler":          body_scaler,    # vector_norm or standardize; carries its own indices
         "duration_standardizer": {"mu": dur_mu, "sigma": dur_sigma, "space": "log"},
         "inferred_latent_dim":   int(inferred_latent_dim),
         "in_dim":                int(X_train.shape[1]),
@@ -532,10 +577,18 @@ def main():
     print(f"Device: {device}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Organize runs by feature set so pitch-only and full-input experiments live in
+    # separate trees: data/models/body_latent_regressor/<feature_set>/<prefix>_<ts>/.
+    if fixed.get("feature_set"):
+        feature_set_name = str(fixed["feature_set"])
+    elif fixed.get("body_feature_indices"):
+        feature_set_name = "custom"
+    else:
+        feature_set_name = "full"
     job_name = (args.job_name or "").strip()
-    prefix   = job_name if job_name else "run"
+    prefix   = job_name if job_name else feature_set_name
     base_save_dir = fixed.get("save_dir", "data/models/body_latent_regressor")
-    save_dir = os.path.join(base_save_dir, f"{prefix}_{timestamp}")
+    save_dir = os.path.join(base_save_dir, feature_set_name, f"{prefix}_{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
     print(f"Models → {save_dir}", flush=True)
 
@@ -586,6 +639,9 @@ def main():
         "hidden_dims":           cfg.get("hidden_dims", [128, 128]),
         "activation":            cfg.get("activation", "gelu"),
         "dropout":               float(cfg.get("dropout", 0.1)),
+        "feature_set":           best_overall_extras["feature_set"],
+        "body_feature_indices":  best_overall_extras["body_feature_indices"],
+        "body_feature_names":    best_overall_extras["body_feature_names"],
         "body_scaler":           best_overall_extras["body_scaler"],
         "duration_standardizer": best_overall_extras["duration_standardizer"],
         "best_val_loss":         best_overall_extras["best_val_loss"],

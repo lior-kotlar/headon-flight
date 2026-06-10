@@ -26,21 +26,26 @@ import torch.nn as nn
 
 from autoencoder import WingbeatAutoencoder
 from body_latent_regressor import BodyLatentRegressor, _load_split
+from data_handling.body_features import scaler_to_offset_scale
 from transform_data import _cubic_resample
 
 
 class BodyToWingbeat(nn.Module):
     """Wraps a trained regressor + frozen decoder; outputs S/A wingbeats.
 
-    The regressor expects a 24-d input formed by concatenating the CURRENT and
-    NEXT wingbeat's mean body kinematics, each divided by a per-3-vector
-    VectorNormScaler scale factor fit on the training set.
+    The regressor consumes a configurable subset of the 12-d body-mean vector
+    (body_feature_indices), selected identically from the CURRENT and NEXT
+    wingbeat's mean body kinematics and scaled per-channel ((x - offset) / scale).
+    Callers always pass the full 12-d body means; the selection happens here, so
+    the same call site serves any feature set ("full" → 24-d, "pitch" → 4-d, ...).
     """
     def __init__(
         self,
         regressor: BodyLatentRegressor,
         autoencoder: WingbeatAutoencoder,
-        body_scale_12: torch.Tensor,
+        body_indices: torch.Tensor,
+        body_offset: torch.Tensor,
+        body_scale: torch.Tensor,
         dur_mu: float,
         dur_sigma: float,
         min_duration: int = 2,
@@ -51,16 +56,19 @@ class BodyToWingbeat(nn.Module):
         for p in self.decoder.parameters():
             p.requires_grad_(False)
 
-        # The 12-d scale vector is applied identically to each half of the 24-d input.
-        self.register_buffer("body_scale_12", body_scale_12)
+        # Selection + per-channel scaling, applied identically to each half.
+        self.register_buffer("body_indices", body_indices.long())
+        self.register_buffer("body_offset",  body_offset.float())
+        self.register_buffer("body_scale",   body_scale.float())
         self.dur_mu       = float(dur_mu)
         self.dur_sigma    = float(dur_sigma)
         self.min_duration = int(min_duration)
 
     def scale_body(self, body_mean: torch.Tensor, next_body_mean: torch.Tensor) -> torch.Tensor:
-        """Both inputs: (B, 12). Returns (B, 24) scaled by shared 12-d factor."""
-        scaled_curr = body_mean      / self.body_scale_12
-        scaled_next = next_body_mean / self.body_scale_12
+        """Both inputs: (B, 12). Selects body_indices from each half, scales them
+        ((x - offset) / scale), and concatenates → (B, 2 * len(indices))."""
+        scaled_curr = (body_mean.index_select(-1, self.body_indices)      - self.body_offset) / self.body_scale
+        scaled_next = (next_body_mean.index_select(-1, self.body_indices) - self.body_offset) / self.body_scale
         return torch.cat([scaled_curr, scaled_next], dim=-1)
 
     def predict_latent_and_duration(
@@ -135,17 +143,19 @@ def load_body_to_wingbeat(
             f"latent_dim mismatch: regressor={regressor.latent_dim} ae={ae.latent_dim}"
         )
 
-    body_scaler   = r_ckpt["body_scaler"]
-    if body_scaler.get("type") != "vector_norm":
-        raise ValueError(
-            f"Unexpected body_scaler.type {body_scaler.get('type')!r}; expected 'vector_norm'."
-        )
-    body_scale_12 = torch.tensor(body_scaler["scale_factors"], dtype=torch.float32)
-    dur_mu        = float(r_ckpt["duration_standardizer"]["mu"])
-    dur_sigma     = float(r_ckpt["duration_standardizer"]["sigma"])
+    # The body-scaler dict carries everything needed to reproduce selection +
+    # scaling (both "vector_norm" full-input and "standardize" subset forms).
+    indices, offset, scale = scaler_to_offset_scale(r_ckpt["body_scaler"])
+    body_indices = torch.tensor(indices, dtype=torch.long)
+    body_offset  = torch.from_numpy(offset)
+    body_scale   = torch.from_numpy(scale)
+    dur_mu       = float(r_ckpt["duration_standardizer"]["mu"])
+    dur_sigma    = float(r_ckpt["duration_standardizer"]["sigma"])
 
     return BodyToWingbeat(
-        regressor, ae, body_scale_12.to(device), dur_mu, dur_sigma,
+        regressor, ae,
+        body_indices.to(device), body_offset.to(device), body_scale.to(device),
+        dur_mu, dur_sigma,
     ).to(device)
 
 

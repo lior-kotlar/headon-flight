@@ -39,21 +39,31 @@ import numpy as np
 
 from body_latent_regressor import (
     _load_split,
-    _fit_vector_norm_scale,
+    _fit_body_scaler,
     _resolve_ae_model_dir,
+)
+from data_handling.body_features import (
+    resolve_feature_set,
+    default_scaler_type,
+    apply_body_scaler_np,
 )
 from evaluate_body_to_wingbeat import compute_per_dim_r2, compute_retrieval_metrics
 
 
-def _scaled_inputs(splits: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return (X_train, X_val, y_train, y_val) with inputs scaled exactly as in
-    training: VectorNormScaler fit on train current body_means, the 12-d factor
-    applied to both halves of the 24-d (current, next) input."""
+def _scaled_inputs(
+    splits: dict,
+    feature_set: str | None = None,
+    body_feature_indices: list[int] | None = None,
+    scaler_type: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return (X_train, X_val, y_train, y_val) with inputs selected + scaled exactly
+    as in training: the chosen feature set is selected from both the current and next
+    body_means, with the scaler fit on the train current-wingbeat selected channels."""
     tr, vl = splits["train_idx"], splits["val_idx"]
-    scale_12 = _fit_vector_norm_scale(splits["body_means"][tr])          # (12,)
-    scale_24 = np.concatenate([scale_12, scale_12])[None, :]             # (1, 24)
-    X_full = np.concatenate([splits["body_means"], splits["next_body_means"]], axis=1)
-    X = (X_full / scale_24).astype(np.float32)
+    indices, _ = resolve_feature_set(feature_set, body_feature_indices)
+    scaler_type = scaler_type or default_scaler_type(indices)
+    body_scaler = _fit_body_scaler(splits["body_means"][tr], indices, scaler_type)
+    X = apply_body_scaler_np(splits["body_means"], splits["next_body_means"], body_scaler)
     y = splits["target_latents"].astype(np.float32)
     return X[tr], X[vl], y[tr], y[vl]
 
@@ -141,13 +151,20 @@ def main() -> None:
                    help="Dir with val_indices.json (defines the regressor's val split).")
     p.add_argument("--ks", type=int, nargs="+", default=[1, 5, 10, 25, 50])
     p.add_argument("--ridge_alphas", type=float, nargs="+", default=[0.0, 1.0, 10.0, 100.0])
+    p.add_argument("--feature_set", default="full",
+                   help="Named body feature set to diagnose (full, pitch, pitch_accel, ...). "
+                        "Restrict inputs to compare the achievable ceiling across feature views.")
+    p.add_argument("--body_feature_indices", type=int, nargs="+", default=None,
+                   help="Explicit body-channel indices (overrides --feature_set).")
     args = p.parse_args()
 
     ae_dir = _resolve_ae_model_dir(args.autoencoder_dir)
     splits = _load_split(args.dataset_path, os.path.join(ae_dir, "val_indices.json"))
-    Xtr, Xval, ytr, yval = _scaled_inputs(splits)
+    indices, feat_names = resolve_feature_set(args.feature_set, args.body_feature_indices)
+    Xtr, Xval, ytr, yval = _scaled_inputs(splits, args.feature_set, args.body_feature_indices)
     print(f"Dataset:     {args.dataset_path}")
     print(f"AE split:    {ae_dir}")
+    print(f"Feature set: {feat_names} (indices {indices})")
     print(f"Train/val:   {len(Xtr)} / {len(Xval)}   input_dim={Xtr.shape[1]}  latent_dim={ytr.shape[1]}")
     print()
 
