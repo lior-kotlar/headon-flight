@@ -87,16 +87,57 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 from autoencoder import WingbeatAutoencoder
-from transform_data import _cubic_resample
+from transform_data import (
+    _cubic_resample,
+    SINGLE_WING_PHYSICAL_SCALE,
+    fixed_len_dataset_path,
+    single_wing_template_path,
+)
 from data_handling.bucket_eval import _reconstruct_wing_angles_from_normalized_sa
 
 
-# Per-angle layout in the (L, 6) wing-angle space, matching bucket_eval._PLOT_ANGLES.
-_ANGLES = [
-    ("Stroke φ (deg)",    0, 3),
-    ("Deviation θ (deg)", 1, 4),
-    ("Rotation ψ (deg)",  2, 5),
-]
+# The three wing angles, in row order. Which channel column holds each angle for a
+# given wing differs per representation (see _build_repr_plot).
+_ANGLE_ROW_LABELS = ["Stroke φ (deg)", "Deviation θ (deg)", "Rotation ψ (deg)"]
+
+
+def _reconstruct_single_wing(res_norm: np.ndarray, template_L: np.ndarray) -> np.ndarray:
+    """
+    Inverse of the fixed-L single-wing build: undo SINGLE_WING_PHYSICAL_SCALE on the
+    (3, L) channels-first residual and add the single-wing template. Returns (L, 3)
+    wing angles in radians. Mirrors bucket_eval._reconstruct_wing_angles_from_normalized_sa
+    for the 6-ch S/A representation.
+    """
+    res = res_norm.T.astype(np.float64) * SINGLE_WING_PHYSICAL_SCALE      # (L, 3) rad
+    return res + template_L
+
+
+def _build_repr_plot(representation: str, template_L: np.ndarray) -> dict:
+    """
+    Bundle everything the plotting code needs to turn decoder channel output into a
+    wing-angle figure, abstracted over the representation:
+
+      n_channels    — decoder channels (6 for 'sa', 3 for 'single_wing')
+      wings         — list of (column_title, [phi_col, theta_col, psi_col]); one entry
+                      per subplot column. 'sa' has Left/Right; 'single_wing' has one wing.
+      reconstruct   — fn(recon_chan (C, L), template_L) → (L, C) wing angles in radians
+      template_L    — (L, C) template resampled to the model's output length, radians
+    """
+    if representation == "single_wing":
+        return {
+            "representation": "single_wing",
+            "n_channels":     3,
+            "wings":          [("Wing", [0, 1, 2])],
+            "reconstruct":    _reconstruct_single_wing,
+            "template_L":     template_L,
+        }
+    return {
+        "representation": "sa",
+        "n_channels":     6,
+        "wings":          [("Left wing", [0, 1, 2]), ("Right wing", [3, 4, 5])],
+        "reconstruct":    _reconstruct_wing_angles_from_normalized_sa,
+        "template_L":     template_L,
+    }
 
 _ANALYSIS_CHOICES = (
     "variance",
@@ -122,6 +163,7 @@ def _load_model(model_dir: str, device: str):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model = WingbeatAutoencoder(
         latent_dim          = ckpt["latent_dim"],
+        in_channels         = ckpt.get("in_channels", 6),
         activation          = ckpt.get("activation", "gelu"),
         dropout             = ckpt.get("dropout", 0.0),
         base_channels       = ckpt.get("base_channels", 128),
@@ -140,9 +182,11 @@ def _load_inputs(model_dir: str, device: str, npz_path_override: str | None):
     encode the val set, return a bundle of derived tensors.
     """
     model, ckpt = _load_model(model_dir, device)
-    latent_dim  = int(ckpt["latent_dim"])
-    output_len  = int(ckpt["output_len"])
-    lat_prefix  = f"lat_{latent_dim:02d}_"
+    latent_dim     = int(ckpt["latent_dim"])
+    output_len     = int(ckpt["output_len"])
+    representation = ckpt.get("representation", "sa")
+    n_channels     = int(ckpt.get("in_channels", 6))
+    lat_prefix     = f"lat_{latent_dim:02d}_"
 
     with open(os.path.join(model_dir, "best_config.json")) as f:
         config = json.load(f)
@@ -150,17 +194,28 @@ def _load_inputs(model_dir: str, device: str, npz_path_override: str | None):
         npz_path = npz_path_override
     else:
         data_dir = os.path.dirname(os.path.abspath(config["data_path"]))
-        npz_path = os.path.join(data_dir, f"wingbeats_L{output_len}.npz")
-    template_native = np.load(config["template_path"])
-    template_L      = _cubic_resample(template_native, output_len).astype(np.float64)
+        npz_path = fixed_len_dataset_path(data_dir, output_len, representation)
 
-    d         = np.load(npz_path)
-    sa_all_np = d["sa_wingbeats"]                                              # (N, 6, L)
-    sa_all    = torch.from_numpy(sa_all_np).float().to(device)
-    n_val     = sa_all.shape[0]
+    # The single-wing representation keys its npz array differently and uses the
+    # 3-angle template sibling of the 6-ch golden template.
+    if representation == "single_wing":
+        array_key     = "single_wing_wingbeats"
+        template_path = single_wing_template_path(config["template_path"])
+    else:
+        array_key     = "sa_wingbeats"
+        template_path = config["template_path"]
+
+    template_native = np.load(template_path)
+    template_L      = _cubic_resample(template_native, output_len).astype(np.float64)
+    repr_plot       = _build_repr_plot(representation, template_L)
+
+    d          = np.load(npz_path)
+    sa_all_np  = d[array_key]                                                  # (N, C, L)
+    sa_all     = torch.from_numpy(sa_all_np).float().to(device)
+    n_val      = sa_all.shape[0]
     print(
-        f"Loaded model: latent_dim={latent_dim}, output_len={output_len}; "
-        f"encoding {n_val} wingbeats.",
+        f"Loaded model: representation={representation}, latent_dim={latent_dim}, "
+        f"in_channels={n_channels}, output_len={output_len}; encoding {n_val} wingbeats.",
         flush=True,
     )
 
@@ -170,19 +225,22 @@ def _load_inputs(model_dir: str, device: str, npz_path_override: str | None):
         z_std  = z_all.std (dim=0)
 
     return {
-        "model":      model,
-        "ckpt":       ckpt,
-        "latent_dim": latent_dim,
-        "output_len": output_len,
-        "lat_prefix": lat_prefix,
-        "config":     config,
-        "npz_path":   npz_path,
-        "template_L": template_L,
-        "sa_all":     sa_all,
-        "z_all":      z_all,
-        "z_mean":     z_mean,
-        "z_std":      z_std,
-        "n_val":      n_val,
+        "model":          model,
+        "ckpt":           ckpt,
+        "latent_dim":     latent_dim,
+        "output_len":     output_len,
+        "representation": representation,
+        "n_channels":     n_channels,
+        "repr_plot":      repr_plot,
+        "lat_prefix":     lat_prefix,
+        "config":         config,
+        "npz_path":       npz_path,
+        "template_L":     template_L,
+        "sa_all":         sa_all,
+        "z_all":          z_all,
+        "z_mean":         z_mean,
+        "z_std":          z_std,
+        "n_val":          n_val,
     }
 
 
@@ -280,7 +338,7 @@ def _plot_traversal_for_dim(
     z_mean:      torch.Tensor,
     z_std:       torch.Tensor,
     model:       WingbeatAutoencoder,
-    template_L:  np.ndarray,
+    repr_plot:   dict,
     n_steps:     int,
     range_std:   float,
     device:      str,
@@ -290,37 +348,39 @@ def _plot_traversal_for_dim(
     z_sweep = z_mean.unsqueeze(0).repeat(n_steps, 1)
     z_sweep[:, k] = z_mean[k] + deltas * z_std[k]
     with torch.no_grad():
-        recon_sa = model.decode(z_sweep).cpu().numpy()                          # (n_steps, 6, L)
+        recon_sa = model.decode(z_sweep).cpu().numpy()                          # (n_steps, C, L)
 
+    template_L   = repr_plot["template_L"]
+    reconstruct  = repr_plot["reconstruct"]
+    wings        = repr_plot["wings"]
     L            = template_L.shape[0]
     phase        = np.linspace(0.0, 1.0, L)
     template_deg = np.rad2deg(template_L)
     colors       = plt.get_cmap("coolwarm")(np.linspace(0.0, 1.0, n_steps))
     mid_idx      = n_steps // 2
 
-    fig, axes = plt.subplots(3, 2, figsize=(11.5, 8.5), sharex=True)
+    fig, axes = plt.subplots(3, len(wings), figsize=(5.75 * len(wings), 8.5),
+                             sharex=True, squeeze=False)
     fig.suptitle(
         f"Latent traversal — dim {k}   (z_mean={float(z_mean[k]):+.3f}, "
         f"z_std={float(z_std[k]):.3f})   ±{range_std:.1f}σ, {n_steps} steps",
         fontsize=13,
     )
-    wing_labels = ["Left wing", "Right wing"]
-    for col_wing in (0, 1):
-        for row, (angle_label, L_col, R_col) in enumerate(_ANGLES):
-            ax       = axes[row, col_wing]
-            use_col  = L_col if col_wing == 0 else R_col
+    for col_idx, (wing_title, wing_cols) in enumerate(wings):
+        for row, angle_label in enumerate(_ANGLE_ROW_LABELS):
+            ax       = axes[row, col_idx]
+            use_col  = wing_cols[row]
             ax.plot(phase, template_deg[:, use_col],
                     color="0.5", linestyle="--", lw=1.2, alpha=0.7, label="Template")
             for step_idx in range(n_steps):
-                wing_angles = _reconstruct_wing_angles_from_normalized_sa(
-                    recon_sa[step_idx], template_L)
+                wing_angles = reconstruct(recon_sa[step_idx], template_L)
                 lw = 2.2 if step_idx == mid_idx else 1.3
                 ax.plot(phase, np.rad2deg(wing_angles[:, use_col]),
                         color=colors[step_idx], lw=lw)
             ax.grid(True, alpha=0.4)
             if row == 0:
-                ax.set_title(wing_labels[col_wing], fontsize=11)
-            if col_wing == 0:
+                ax.set_title(wing_title, fontsize=11)
+            if col_idx == 0:
                 ax.set_ylabel(angle_label, fontsize=10)
             if row == 2:
                 ax.set_xlabel("Normalized phase")
@@ -339,7 +399,7 @@ def run_traversal(
     out_dir:    str,
     lat_prefix: str,
     model:      WingbeatAutoencoder,
-    template_L: np.ndarray,
+    repr_plot:  dict,
     z_mean:     torch.Tensor,
     z_std:      torch.Tensor,
     latent_dim: int,
@@ -351,7 +411,7 @@ def run_traversal(
     for k in range(latent_dim):
         out_path = os.path.join(out_dir, f"{lat_prefix}dim_{k:03d}.png")
         _plot_traversal_for_dim(
-            k=k, z_mean=z_mean, z_std=z_std, model=model, template_L=template_L,
+            k=k, z_mean=z_mean, z_std=z_std, model=model, repr_plot=repr_plot,
             n_steps=n_steps, range_std=range_std, device=device, out_path=out_path,
         )
         print(f"  → wrote {out_path}", flush=True)
@@ -367,7 +427,7 @@ def _plot_distribution_sampling_for_dim(
     z_all_k:      np.ndarray,        # (N,) — empirical values of z[:, k]
     z_mean:       torch.Tensor,      # (latent_dim,)
     model:        WingbeatAutoencoder,
-    template_L:   np.ndarray,
+    repr_plot:    dict,
     n_samples:    int,
     device:       str,
     rng:          np.random.Generator,
@@ -385,19 +445,24 @@ def _plot_distribution_sampling_for_dim(
     z_sweep[:, k] = torch.from_numpy(sampled_vals).to(device=device, dtype=z_sweep.dtype)
     # 3. Decode in one batched pass.
     with torch.no_grad():
-        recon_sa = model.decode(z_sweep).cpu().numpy()                          # (n_samples, 6, L)
+        recon_sa = model.decode(z_sweep).cpu().numpy()                          # (n_samples, C, L)
 
+    template_L   = repr_plot["template_L"]
+    reconstruct  = repr_plot["reconstruct"]
+    wings        = repr_plot["wings"]
+    n_channels   = repr_plot["n_channels"]
     L            = template_L.shape[0]
     phase        = np.linspace(0.0, 1.0, L)
     template_deg = np.rad2deg(template_L)
 
     # Pre-convert every reconstruction to wing-angle space once, then plot
-    # per-cell from the cached (n_samples, L, 6) tensor.
-    wing_deg = np.empty((n_samples, L, 6), dtype=np.float64)
+    # per-cell from the cached (n_samples, L, C) tensor.
+    wing_deg = np.empty((n_samples, L, n_channels), dtype=np.float64)
     for i in range(n_samples):
-        wing_deg[i] = np.rad2deg(_reconstruct_wing_angles_from_normalized_sa(recon_sa[i], template_L))
+        wing_deg[i] = np.rad2deg(reconstruct(recon_sa[i], template_L))
 
-    fig, axes = plt.subplots(3, 2, figsize=(11.5, 8.5), sharex=True)
+    fig, axes = plt.subplots(3, len(wings), figsize=(5.75 * len(wings), 8.5),
+                             sharex=True, squeeze=False)
     fig.suptitle(
         f"Distribution sampling — dim {k}   "
         f"(z_mean={float(z_mean[k]):+.3f},  "
@@ -405,11 +470,11 @@ def _plot_distribution_sampling_for_dim(
         f"max={sampled_vals.max():+.3f}, n={n_samples})",
         fontsize=12,
     )
-    wing_labels = ["Left wing", "Right wing"]
-    for col_wing in (0, 1):
-        for row, (angle_label, L_col, R_col) in enumerate(_ANGLES):
-            ax       = axes[row, col_wing]
-            use_col  = L_col if col_wing == 0 else R_col
+    last_col = len(wings) - 1
+    for col_idx, (wing_title, wing_cols) in enumerate(wings):
+        for row, angle_label in enumerate(_ANGLE_ROW_LABELS):
+            ax       = axes[row, col_idx]
+            use_col  = wing_cols[row]
             ys = wing_deg[:, :, use_col]                                        # (n_samples, L)
             # Spaghetti — all sampled curves, low alpha.
             for i in range(n_samples):
@@ -425,12 +490,12 @@ def _plot_distribution_sampling_for_dim(
                     alpha=0.7, label="Template")
             ax.grid(True, alpha=0.4)
             if row == 0:
-                ax.set_title(wing_labels[col_wing], fontsize=11)
-            if col_wing == 0:
+                ax.set_title(wing_title, fontsize=11)
+            if col_idx == 0:
                 ax.set_ylabel(angle_label, fontsize=10)
             if row == 2:
                 ax.set_xlabel("Normalized phase")
-            if row == 0 and col_wing == 1:
+            if row == 0 and col_idx == last_col:
                 ax.legend(fontsize=8, loc="upper right")
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -442,7 +507,7 @@ def run_distribution_sampling(
     out_dir:    str,
     lat_prefix: str,
     model:      WingbeatAutoencoder,
-    template_L: np.ndarray,
+    repr_plot:  dict,
     z_all:      torch.Tensor,
     z_mean:     torch.Tensor,
     latent_dim: int,
@@ -457,7 +522,7 @@ def run_distribution_sampling(
         out_path = os.path.join(out_dir, f"{lat_prefix}dim_{k:03d}.png")
         _plot_distribution_sampling_for_dim(
             k=k, z_all_k=z_all_np[:, k], z_mean=z_mean, model=model,
-            template_L=template_L, n_samples=n_samples, device=device, rng=rng,
+            repr_plot=repr_plot, n_samples=n_samples, device=device, rng=rng,
             out_path=out_path,
         )
         print(f"  → wrote {out_path}", flush=True)
@@ -584,7 +649,7 @@ def _plot_pca_traversal_for_pc(
     pca:         dict,
     z_mean:      torch.Tensor,
     model:       WingbeatAutoencoder,
-    template_L:  np.ndarray,
+    repr_plot:   dict,
     n_steps:     int,
     range_std:   float,
     device:      str,
@@ -601,38 +666,40 @@ def _plot_pca_traversal_for_pc(
     z_sweep   = z_mean.unsqueeze(0).repeat(n_steps, 1).clone()
     z_sweep  += (deltas * sigma_k).unsqueeze(1) * component.unsqueeze(0)
     with torch.no_grad():
-        recon_sa = model.decode(z_sweep).cpu().numpy()                          # (n_steps, 6, L)
+        recon_sa = model.decode(z_sweep).cpu().numpy()                          # (n_steps, C, L)
 
+    template_L   = repr_plot["template_L"]
+    reconstruct  = repr_plot["reconstruct"]
+    wings        = repr_plot["wings"]
     L            = template_L.shape[0]
     phase        = np.linspace(0.0, 1.0, L)
     template_deg = np.rad2deg(template_L)
     colors       = plt.get_cmap("coolwarm")(np.linspace(0.0, 1.0, n_steps))
     mid_idx      = n_steps // 2
 
-    fig, axes = plt.subplots(3, 2, figsize=(11.5, 8.5), sharex=True)
+    fig, axes = plt.subplots(3, len(wings), figsize=(5.75 * len(wings), 8.5),
+                             sharex=True, squeeze=False)
     fig.suptitle(
         f"Latent PCA traversal — PC {k}   "
         f"(σ={sigma_k:.3f}, explained var={100 * pca['explained_ratio'][k]:.1f}%)   "
         f"±{range_std:.1f}σ, {n_steps} steps",
         fontsize=13,
     )
-    wing_labels = ["Left wing", "Right wing"]
-    for col_wing in (0, 1):
-        for row, (angle_label, L_col, R_col) in enumerate(_ANGLES):
-            ax       = axes[row, col_wing]
-            use_col  = L_col if col_wing == 0 else R_col
+    for col_idx, (wing_title, wing_cols) in enumerate(wings):
+        for row, angle_label in enumerate(_ANGLE_ROW_LABELS):
+            ax       = axes[row, col_idx]
+            use_col  = wing_cols[row]
             ax.plot(phase, template_deg[:, use_col],
                     color="0.5", linestyle="--", lw=1.2, alpha=0.7, label="Template")
             for step_idx in range(n_steps):
-                wing_angles = _reconstruct_wing_angles_from_normalized_sa(
-                    recon_sa[step_idx], template_L)
+                wing_angles = reconstruct(recon_sa[step_idx], template_L)
                 lw = 2.2 if step_idx == mid_idx else 1.3
                 ax.plot(phase, np.rad2deg(wing_angles[:, use_col]),
                         color=colors[step_idx], lw=lw)
             ax.grid(True, alpha=0.4)
             if row == 0:
-                ax.set_title(wing_labels[col_wing], fontsize=11)
-            if col_wing == 0:
+                ax.set_title(wing_title, fontsize=11)
+            if col_idx == 0:
                 ax.set_ylabel(angle_label, fontsize=10)
             if row == 2:
                 ax.set_xlabel("Normalized phase")
@@ -651,7 +718,7 @@ def run_pca(
     out_dir:    str,
     lat_prefix: str,
     model:      WingbeatAutoencoder,
-    template_L: np.ndarray,
+    repr_plot:  dict,
     z_all:      torch.Tensor,
     z_mean:     torch.Tensor,
     latent_dim: int,
@@ -684,7 +751,7 @@ def run_pca(
     for k in range(n_pc):
         out_path = os.path.join(out_dir, f"{lat_prefix}pc_{k:03d}.png")
         _plot_pca_traversal_for_pc(
-            k=k, pca=pca, z_mean=z_mean, model=model, template_L=template_L,
+            k=k, pca=pca, z_mean=z_mean, model=model, repr_plot=repr_plot,
             n_steps=n_steps, range_std=range_std, device=device, out_path=out_path,
         )
         print(f"  → wrote {out_path}", flush=True)
@@ -867,10 +934,12 @@ def _plot_zscores(comparisons: list[dict], latent_dim: int, out_path: str) -> No
 
 def _plot_decoded_overlay(
     decoded:       dict,
-    template_L:    np.ndarray,
+    repr_plot:     dict,
     out_path:      str,
     latent_dim:    int,
 ) -> None:
+    template_L = repr_plot["template_L"]
+    wings      = repr_plot["wings"]
     L = template_L.shape[0]
     phase = np.linspace(0.0, 1.0, L)
     template_deg = np.rad2deg(template_L)
@@ -881,16 +950,17 @@ def _plot_decoded_overlay(
         ("z_template", "tab:blue",   "solid",  1.6, 0.95),
     ]
 
-    fig, axes = plt.subplots(3, 2, figsize=(11.5, 8.5), sharex=True)
+    fig, axes = plt.subplots(3, len(wings), figsize=(5.75 * len(wings), 8.5),
+                             sharex=True, squeeze=False)
     fig.suptitle(
         f"Decoded reference latents vs the golden template  (latent_dim={latent_dim})",
         fontsize=13,
     )
-    wing_titles = ["Left wing", "Right wing"]
-    for col_wing in (0, 1):
-        for row, (angle_label, L_col, R_col) in enumerate(_ANGLES):
-            ax = axes[row, col_wing]
-            use_col = L_col if col_wing == 0 else R_col
+    last_col = len(wings) - 1
+    for col_idx, (wing_title, wing_cols) in enumerate(wings):
+        for row, angle_label in enumerate(_ANGLE_ROW_LABELS):
+            ax = axes[row, col_idx]
+            use_col = wing_cols[row]
             ax.plot(phase, template_deg[:, use_col],
                     color="0.25", lw=2.4, label="Template (input)")
             for name, color, style, lw, alpha in line_specs:
@@ -900,12 +970,12 @@ def _plot_decoded_overlay(
                         label=f"decoder({name})")
             ax.grid(True, alpha=0.4)
             if row == 0:
-                ax.set_title(wing_titles[col_wing], fontsize=11)
-            if col_wing == 0:
+                ax.set_title(wing_title, fontsize=11)
+            if col_idx == 0:
                 ax.set_ylabel(angle_label, fontsize=10)
             if row == 2:
                 ax.set_xlabel("Normalized phase")
-            if row == 0 and col_wing == 1:
+            if row == 0 and col_idx == last_col:
                 ax.legend(fontsize=8, loc="upper right")
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -914,7 +984,7 @@ def _plot_decoded_overlay(
 
 def _save_decoded_overlay_plotly(
     decoded:    dict,
-    template_L: np.ndarray,
+    repr_plot:  dict,
     out_path:   str,
     latent_dim: int,
 ) -> None:
@@ -925,6 +995,9 @@ def _save_decoded_overlay_plotly(
         print("plotly not installed — skipping interactive HTML decoded plot.", flush=True)
         return
 
+    template_L   = repr_plot["template_L"]
+    wings        = repr_plot["wings"]
+    n_cols       = len(wings)
     L            = template_L.shape[0]
     phase        = np.linspace(0.0, 1.0, L)
     template_deg = np.rad2deg(template_L)
@@ -937,20 +1010,23 @@ def _save_decoded_overlay_plotly(
     ]
     decoded_keys = ["z_zero", "z_mean", "z_template"]
 
+    angle_short = ["Stroke φ", "Deviation θ", "Rotation ψ"]
+    # Subplot titles laid out row-major: for each row (angle) iterate the wing columns.
+    subplot_titles = [
+        f"{wing_title} — {angle_short[row]}"
+        for row in range(3) for wing_title, _ in wings
+    ]
     fig = make_subplots(
-        rows=3, cols=2,
+        rows=3, cols=n_cols,
         shared_xaxes=True,
-        subplot_titles=("Left wing — Stroke φ",     "Right wing — Stroke φ",
-                        "Left wing — Deviation θ", "Right wing — Deviation θ",
-                        "Left wing — Rotation ψ",  "Right wing — Rotation ψ"),
+        subplot_titles=subplot_titles,
         vertical_spacing=0.06, horizontal_spacing=0.06,
     )
     y_titles = ["Stroke φ [deg]", "Deviation θ [deg]", "Rotation ψ [deg]"]
 
-    for col_wing in (0, 1):
-        plotly_col = col_wing + 1
-        for row, (_, L_col, R_col) in enumerate(_ANGLES, start=1):
-            use_col = L_col if col_wing == 0 else R_col
+    for col_idx, (wing_title, wing_cols) in enumerate(wings):
+        plotly_col = col_idx + 1
+        for row, use_col in enumerate(wing_cols, start=1):
             t_name, t_color, t_dash, t_width = template_spec
             fig.add_trace(
                 go.Scatter(
@@ -958,7 +1034,7 @@ def _save_decoded_overlay_plotly(
                     mode="lines", name=t_name,
                     line=dict(color=t_color, width=t_width, dash=t_dash),
                     legendgroup=t_name,
-                    showlegend=(row == 1 and col_wing == 0),
+                    showlegend=(row == 1 and col_idx == 0),
                 ),
                 row=row, col=plotly_col,
             )
@@ -970,17 +1046,17 @@ def _save_decoded_overlay_plotly(
                         mode="lines", name=trace_name,
                         line=dict(color=color, width=width, dash=dash),
                         legendgroup=trace_name,
-                        showlegend=(row == 1 and col_wing == 0),
+                        showlegend=(row == 1 and col_idx == 0),
                     ),
                     row=row, col=plotly_col,
                 )
             fig.update_yaxes(title_text=y_titles[row - 1], row=row, col=plotly_col)
-    fig.update_xaxes(title_text="Normalized phase", row=3, col=1)
-    fig.update_xaxes(title_text="Normalized phase", row=3, col=2)
+    for plotly_col in range(1, n_cols + 1):
+        fig.update_xaxes(title_text="Normalized phase", row=3, col=plotly_col)
 
     fig.update_layout(
         title=f"Decoded reference latents vs the golden template  (latent_dim={latent_dim})",
-        height=900, width=1300,
+        height=900, width=max(700, 650 * n_cols),
         hovermode="x unified",
         template="plotly_white",
     )
@@ -991,7 +1067,7 @@ def run_template_vs_mean(
     out_dir:    str,
     lat_prefix: str,
     model:      WingbeatAutoencoder,
-    template_L: np.ndarray,
+    repr_plot:  dict,
     z_all:      torch.Tensor,
     z_mean:     torch.Tensor,
     z_std:      torch.Tensor,
@@ -1003,9 +1079,12 @@ def run_template_vs_mean(
     device:     str,
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
+    template_L  = repr_plot["template_L"]
+    reconstruct = repr_plot["reconstruct"]
+    n_channels  = repr_plot["n_channels"]
 
     with torch.no_grad():
-        zero_input = torch.zeros((1, 6, output_len), dtype=torch.float32, device=device)
+        zero_input = torch.zeros((1, n_channels, output_len), dtype=torch.float32, device=device)
         z_template = model.encode(zero_input).squeeze(0)
         z_zero     = torch.zeros(latent_dim, dtype=torch.float32, device=device)
 
@@ -1048,8 +1127,7 @@ def run_template_vs_mean(
     with torch.no_grad():
         for name, z_vec in [("z_template", z_template), ("z_mean", z_mean), ("z_zero", z_zero)]:
             recon_sa = model.decode(z_vec.unsqueeze(0)).cpu().numpy()
-            decoded_wings[name] = _reconstruct_wing_angles_from_normalized_sa(
-                recon_sa[0], template_L)
+            decoded_wings[name] = reconstruct(recon_sa[0], template_L)
 
     json_payload = {
         "latent_dim":  latent_dim,
@@ -1072,8 +1150,8 @@ def run_template_vs_mean(
     with open(json_path, "w") as f:
         json.dump(json_payload, f, indent=2)
     _plot_zscores(comparisons, latent_dim, zscore_path)
-    _plot_decoded_overlay(decoded_wings, template_L, decoded_png_path, latent_dim)
-    _save_decoded_overlay_plotly(decoded_wings, template_L, decoded_html_path, latent_dim)
+    _plot_decoded_overlay(decoded_wings, repr_plot, decoded_png_path, latent_dim)
+    _save_decoded_overlay_plotly(decoded_wings, repr_plot, decoded_html_path, latent_dim)
     print(f"  → wrote {json_path}",         flush=True)
     print(f"  → wrote {zscore_path}",       flush=True)
     print(f"  → wrote {decoded_png_path}",  flush=True)
@@ -1141,7 +1219,7 @@ def main() -> None:
         run_template_vs_mean(
             out_dir=os.path.join(out_root, "template_vs_mean"),
             lat_prefix=ctx["lat_prefix"],
-            model=ctx["model"], template_L=ctx["template_L"],
+            model=ctx["model"], repr_plot=ctx["repr_plot"],
             z_all=ctx["z_all"], z_mean=ctx["z_mean"], z_std=ctx["z_std"],
             latent_dim=ctx["latent_dim"], output_len=ctx["output_len"],
             npz_path=ctx["npz_path"], n_val=ctx["n_val"],
@@ -1153,7 +1231,7 @@ def main() -> None:
         run_pca(
             out_dir=os.path.join(out_root, "pca"),
             lat_prefix=ctx["lat_prefix"],
-            model=ctx["model"], template_L=ctx["template_L"],
+            model=ctx["model"], repr_plot=ctx["repr_plot"],
             z_all=ctx["z_all"], z_mean=ctx["z_mean"],
             latent_dim=ctx["latent_dim"],
             n_steps=args.n_steps, range_std=args.range_std, device=device,
@@ -1174,7 +1252,7 @@ def main() -> None:
         run_traversal(
             out_dir=os.path.join(out_root, "traversal"),
             lat_prefix=ctx["lat_prefix"],
-            model=ctx["model"], template_L=ctx["template_L"],
+            model=ctx["model"], repr_plot=ctx["repr_plot"],
             z_mean=ctx["z_mean"], z_std=ctx["z_std"],
             latent_dim=ctx["latent_dim"],
             n_steps=args.n_steps, range_std=args.range_std, device=device,
@@ -1185,7 +1263,7 @@ def main() -> None:
         run_distribution_sampling(
             out_dir=os.path.join(out_root, "distribution_sampling"),
             lat_prefix=ctx["lat_prefix"],
-            model=ctx["model"], template_L=ctx["template_L"],
+            model=ctx["model"], repr_plot=ctx["repr_plot"],
             z_all=ctx["z_all"], z_mean=ctx["z_mean"],
             latent_dim=ctx["latent_dim"],
             n_samples=args.n_samples, device=device, seed=args.sampling_seed,
