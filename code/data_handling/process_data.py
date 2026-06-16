@@ -1,14 +1,13 @@
 import os
-import random
+import glob
 import argparse
 import h5py
 import numpy as np
 from scipy.signal import savgol_filter
-import torch
 from loguru import logger
 import shutil
 
-SAMPLING_RATE = 16000 
+SAMPLING_RATE = 16000
 VELOCITY_POLYORDER = 2
 ACCELERATION_POLYORDER = 3
 PROCESSED_FILE_SUFFIX = "_condensed_data.h5"
@@ -16,10 +15,10 @@ UNPROCESSED_FILE_SUFFIX = "_analysis_smoothed.h5"
 
 GENERAL_DATASET_DIR = "./data/"
 UNPROCESSED_FLIGHT_DATA_DIR = os.path.join(GENERAL_DATASET_DIR, "unprocessed_data")
-PROCESSED_TRAIN_FLIGHT_DATA_DIR = os.path.join(GENERAL_DATASET_DIR, "train_processed_data")
-PROCESSED_PREDICTION_FLIGHT_DATA_DIR = os.path.join(GENERAL_DATASET_DIR, "prediction_processed_data")
-TRAIN_DATASETS_DIR = os.path.join(GENERAL_DATASET_DIR, "train_datasets")
-PREDICTION_DATASETS_DIR = os.path.join(GENERAL_DATASET_DIR, "prediction_datasets")
+# Condensed output lives one subfolder per experiment under PROCESSED_DATA_DIR
+# (e.g. data/processed/roni_60ms/). transform_data + build_regressor_dataset
+# gather all of them recursively via gather_condensed_h5().
+PROCESSED_DATA_DIR = os.path.join(GENERAL_DATASET_DIR, "processed")
 
 class FeaturesConstants:
     CENTER_OF_MASS_RAW = 'center_of_mass_raw'
@@ -214,119 +213,90 @@ def _clear_directory(dir_path: str):
         # If it doesn't exist yet, just create it so the rest of the code doesn't crash
         os.makedirs(dir_path, exist_ok=True)
 
-def build_datasets(forces_indication_vector, use_radians=True):
-    os.makedirs(TRAIN_DATASETS_DIR, exist_ok=True)
+def gather_condensed_h5(processed_dir: str) -> list[str]:
+    """
+    All condensed *.h5 paths under processed_dir, recursively and sorted.
 
-    all_body_inputs, all_wing_targets = [], []
-    for file in os.listdir(PROCESSED_TRAIN_FLIGHT_DATA_DIR):
-        if file.endswith('.h5'):
-            inputs, targets = _extract_features_and_targets(os.path.join(PROCESSED_TRAIN_FLIGHT_DATA_DIR, file), forces_indication_vector, use_radians=use_radians)
-            all_body_inputs.append(torch.from_numpy(inputs))
-            all_wing_targets.append(torch.from_numpy(targets))
-
-    torch.save(all_body_inputs, os.path.join(TRAIN_DATASETS_DIR, "train_input_forces_clean.pt"))
-    torch.save(all_wing_targets, os.path.join(TRAIN_DATASETS_DIR, "train_output_kinematics_clean.pt"))    
-    
-    logger.info(f"Training dataset built with {len(all_body_inputs)} sequences.")
-
-    os.makedirs(PREDICTION_DATASETS_DIR, exist_ok=True)
-    
-    pred_count = 0
-    for file in os.listdir(PROCESSED_PREDICTION_FLIGHT_DATA_DIR):
-        if file.endswith('.h5'):
-            inputs, targets = _extract_features_and_targets(os.path.join(PROCESSED_PREDICTION_FLIGHT_DATA_DIR, file), forces_indication_vector, use_radians=use_radians)
-            
-            AUGMENTED_SUFFIX = "_condensed_data_augmented.h5"
-            if file.endswith(AUGMENTED_SUFFIX):
-                base_name = file.replace(AUGMENTED_SUFFIX, "_augmented")
-            else:
-                base_name = file.replace(PROCESSED_FILE_SUFFIX, "")
-            
-            torch.save([torch.from_numpy(inputs)], os.path.join(PREDICTION_DATASETS_DIR, f"pred_inputs_{base_name}.pt"))
-            torch.save([torch.from_numpy(targets)], os.path.join(PREDICTION_DATASETS_DIR, f"pred_targets_{base_name}.pt"))
-            pred_count += 1
-            
-    logger.info(f"Created {pred_count} isolated prediction datasets in {PREDICTION_DATASETS_DIR}")
-
-def _normalize_prediction_filename(prediction_file):
-    """Normalize user input into a raw-data filename ending with UNPROCESSED_FILE_SUFFIX."""
-    if prediction_file is None:
-        return None
-
-    candidate = os.path.basename(prediction_file.strip())
-    if not candidate:
-        raise ValueError("--prediction_file cannot be empty.")
-
-    if candidate.endswith(UNPROCESSED_FILE_SUFFIX):
-        return candidate
-
-    if candidate.endswith(PROCESSED_FILE_SUFFIX):
-        return candidate.replace(PROCESSED_FILE_SUFFIX, UNPROCESSED_FILE_SUFFIX)
-
-    return f"{candidate}{UNPROCESSED_FILE_SUFFIX}"
+    The condensed data is laid out one subfolder per experiment
+    (e.g. data/processed/roni_60ms/...), so this gathers every experiment into a
+    single deterministic, path-sorted list. Also works for a flat directory.
+    Sorting by full path keeps the trajectory order identical across
+    transform_data.py and build_regressor_dataset.py (both call this), so their
+    trajectory_ids stay in lockstep.
+    """
+    return sorted(glob.glob(os.path.join(processed_dir, "**", "*.h5"), recursive=True))
 
 
-def run_full_pipeline(unprocessed_dir, n_predict, forces_indication_vector, use_radians=True, prediction_file=None):
-    logger.info("Cleaning up output directories from previous runs...")
-    _clear_directory(PROCESSED_TRAIN_FLIGHT_DATA_DIR)
-    _clear_directory(PROCESSED_PREDICTION_FLIGHT_DATA_DIR)
-    _clear_directory(PREDICTION_DATASETS_DIR)
-    _clear_directory(TRAIN_DATASETS_DIR)
-    logger.info("Cleanup complete.")
+def condense_experiment(experiment_dir: str, output_root: str = PROCESSED_DATA_DIR) -> str:
+    """
+    Condense every raw movie in a single experiment dir into
+    <output_root>/<experiment name>/ (auto-named from the input dir). Clears only
+    that experiment's output dir, so re-running one experiment never touches the
+    others. Returns the output dir.
+    """
+    experiment = os.path.basename(os.path.normpath(experiment_dir))
+    output_dir = os.path.join(output_root, experiment)
+    raw_files = sorted(f for f in os.listdir(experiment_dir) if f.endswith(UNPROCESSED_FILE_SUFFIX))
+    if not raw_files:
+        logger.warning(f"No {UNPROCESSED_FILE_SUFFIX} files in {experiment_dir}; skipping.")
+        return output_dir
 
-    all_files = [f for f in os.listdir(unprocessed_dir) if f.endswith(UNPROCESSED_FILE_SUFFIX)]
-    if not all_files:
-        raise ValueError(f"No files ending with {UNPROCESSED_FILE_SUFFIX} found in {unprocessed_dir}.")
+    logger.info(f"Condensing experiment '{experiment}' ({len(raw_files)} movies) -> {output_dir}")
+    _clear_directory(output_dir)
+    n = 0
+    for fname in raw_files:
+        save_path = _process_single_h5(os.path.join(experiment_dir, fname), output_dir)
+        if save_path:
+            augment_dataset(save_path)
+            n += 1
+    logger.info(f"  '{experiment}': condensed {n}/{len(raw_files)} movies (+ L/R-mirror augmented).")
+    return output_dir
 
-    selected_prediction_file = _normalize_prediction_filename(prediction_file)
-    if selected_prediction_file is not None:
-        if selected_prediction_file not in all_files:
-            raise ValueError(
-                f"Requested prediction file '{selected_prediction_file}' was not found in {unprocessed_dir}."
-            )
-        predict_files = [selected_prediction_file]
-        train_files = [f for f in all_files if f != selected_prediction_file]
-        logger.info(
-            f"Found {len(all_files)} files. Using explicit prediction file {selected_prediction_file}; "
-            f"{len(train_files)} files remain for training."
-        )
+
+def _has_raw_h5(d: str) -> bool:
+    return any(f.endswith(UNPROCESSED_FILE_SUFFIX) for f in os.listdir(d))
+
+
+def run_condense(unprocessed_dir: str = UNPROCESSED_FLIGHT_DATA_DIR, output_root: str = PROCESSED_DATA_DIR):
+    """
+    Condense raw data into per-experiment condensed dirs. Auto-detects:
+      - if `unprocessed_dir` holds raw *_analysis_smoothed.h5 files directly, it is
+        treated as ONE experiment;
+      - otherwise each immediate subdirectory that contains raw files is treated as
+        its own experiment.
+    """
+    if _has_raw_h5(unprocessed_dir):
+        experiments = [unprocessed_dir]
     else:
-        if len(all_files) <= n_predict:
-            raise ValueError(f"Not enough files! Found {len(all_files)}, but requested {n_predict} for prediction.")
+        experiments = sorted(
+            os.path.join(unprocessed_dir, name)
+            for name in os.listdir(unprocessed_dir)
+            if os.path.isdir(os.path.join(unprocessed_dir, name))
+            and _has_raw_h5(os.path.join(unprocessed_dir, name))
+        )
+        if not experiments:
+            raise ValueError(
+                f"No {UNPROCESSED_FILE_SUFFIX} files found in {unprocessed_dir} "
+                f"(neither directly nor in any immediate subdirectory)."
+            )
 
-        random.shuffle(all_files)
-        predict_files = all_files[:n_predict]
-        train_files = all_files[n_predict:]
-        logger.info(f"Found {len(all_files)} files. Reserving {n_predict} for prediction, {len(train_files)} for training.")
+    logger.info(f"Condensing {len(experiments)} experiment(s) into {output_root}/")
+    for exp in experiments:
+        condense_experiment(exp, output_root)
+    logger.info("Done.")
 
-    for file in train_files:
-        save_path = _process_single_h5(os.path.join(unprocessed_dir, file), PROCESSED_TRAIN_FLIGHT_DATA_DIR)
-        if save_path:
-            augment_dataset(save_path)
-
-    for file in predict_files:
-        save_path = _process_single_h5(os.path.join(unprocessed_dir, file), PROCESSED_PREDICTION_FLIGHT_DATA_DIR)
-        if save_path:
-            augment_dataset(save_path)
-
-    build_datasets(forces_indication_vector, use_radians=use_radians)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Process fly kinematics and generate ML datasets.")
-    parser.add_argument('--unprocessed_dir', type=str, default=UNPROCESSED_FLIGHT_DATA_DIR, help="Directory containing raw H5 files")
-    parser.add_argument('--forces', type=str, required=True, help="4-bit indication string (e.g., 1111)")
-    parser.add_argument('--n_predict', type=int, default=1, help="Number of experiments to hold out for the prediction dataset")
-    parser.add_argument('--prediction_file', type=str, default=None,
-                        help="Optional explicit file for prediction holdout. If provided, random selection is disabled.")
-    parser.add_argument('--radians', action=argparse.BooleanOptionalAction, default=True, 
-                        help="Convert target angles to radians (Default: True). Pass --no-radians to keep degrees.")
-    
-    args = parser.parse_args()
-    
-    run_full_pipeline(
-        args.unprocessed_dir,
-        args.n_predict,
-        args.forces,
-        args.radians,
-        prediction_file=args.prediction_file,
+    parser = argparse.ArgumentParser(
+        description="Condense raw fly-kinematics H5 into per-experiment condensed dirs."
     )
+    parser.add_argument(
+        '--unprocessed_dir', type=str, default=UNPROCESSED_FLIGHT_DATA_DIR,
+        help="Raw data dir. Either one experiment (has *_analysis_smoothed.h5 directly) "
+             "or a parent of experiment subdirs. Default: data/unprocessed_data (all experiments).")
+    parser.add_argument(
+        '--output_root', type=str, default=PROCESSED_DATA_DIR,
+        help="Parent dir for the per-experiment condensed output. Default: data/processed.")
+    args = parser.parse_args()
+
+    run_condense(args.unprocessed_dir, args.output_root)

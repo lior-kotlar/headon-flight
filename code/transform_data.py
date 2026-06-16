@@ -84,7 +84,7 @@ from loguru import logger
 
 # Allow imports from data_handling/ when run from the project root
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data_handling'))
-from data_handling.process_data import PROCESSED_TRAIN_FLIGHT_DATA_DIR, _extract_features_and_targets
+from data_handling.process_data import PROCESSED_DATA_DIR, _extract_features_and_targets, gather_condensed_h5
 
 # Column indices in the (N, 6) wing matrix: [L_phi, L_theta, L_psi, R_phi, R_theta, R_psi]
 _L_PHI = 0
@@ -449,21 +449,23 @@ def _load_wing_and_body_trajectories(
 
     Body columns from _extract_features_and_targets are [v(3), a(3), ω(3), α(3)].
     """
-    files = sorted(f for f in os.listdir(processed_dir) if f.endswith('.h5'))
-    if not files:
-        raise FileNotFoundError(f"No .h5 files found in {processed_dir}")
+    # Gather condensed files from all experiment subfolders (recursive), sorted by
+    # path so the trajectory order matches build_regressor_dataset.py.
+    paths = gather_condensed_h5(processed_dir)
+    if not paths:
+        raise FileNotFoundError(f"No .h5 files found under {processed_dir}")
 
     wing_trajectories: list[np.ndarray] = []
     body_trajectories: list[np.ndarray] = []
-    for fname in files:
+    for path in paths:
         body_matrix, wing_matrix = _extract_features_and_targets(
-            os.path.join(processed_dir, fname),
+            path,
             forces_indication_vector=None,  # None → keep all 12 body columns
             use_radians=use_radians,
         )
         wing_trajectories.append(wing_matrix)
         body_trajectories.append(body_matrix.astype(np.float32))
-        logger.info(f"  {fname}: wing={wing_matrix.shape} body={body_matrix.shape}")
+        logger.info(f"  {os.path.relpath(path, processed_dir)}: wing={wing_matrix.shape} body={body_matrix.shape}")
 
     return wing_trajectories, body_trajectories
 
@@ -1009,6 +1011,14 @@ def main() -> None:
         help="Path to autoencoder_config.json (provides data_path, template_path, stroke_idx)",
     )
     parser.add_argument(
+        "--processed_dir",
+        type=str,
+        default=None,
+        help="Directory of condensed H5 files to load trajectories from. Default: the shared "
+             "train_processed_data. Point this at an isolated dir to build trajectories.npy + "
+             "template for a data subset (e.g. a new-data-only AE workspace).",
+    )
+    parser.add_argument(
         "--template_res",
         type=int,
         default=69,
@@ -1076,9 +1086,14 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(template_path)), exist_ok=True)
 
     # --- Load wing + body trajectories from processed H5 files ---
-    logger.info(f"Loading trajectories from {PROCESSED_TRAIN_FLIGHT_DATA_DIR} ...")
+    # Precedence: explicit --processed_dir > config "processed_dir" key > global default.
+    # The config key lets a dataset config (e.g. autoencoder_dataset) self-describe its
+    # condensed source, so a bare `transform_data --config <cfg>` rebuilds the right
+    # dataset instead of silently falling back to the shared train_processed_data.
+    processed_dir = args.processed_dir or config.get('processed_dir') or PROCESSED_DATA_DIR
+    logger.info(f"Loading trajectories from {processed_dir} ...")
     trajectories, body_trajectories = _load_wing_and_body_trajectories(
-        PROCESSED_TRAIN_FLIGHT_DATA_DIR, use_radians=not args.no_radians
+        processed_dir, use_radians=not args.no_radians
     )
     logger.info(f"Loaded {len(trajectories)} trajectories (wing + body).")
 

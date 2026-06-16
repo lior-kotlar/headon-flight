@@ -28,8 +28,8 @@ current-wingbeat body_means, the 12-d factor reused for both halves of the
 Run from project root:
     python code/diagnose_regressor_ceiling.py
     python code/diagnose_regressor_ceiling.py \
-        --dataset_path   data/wingbeat_regressor_dataset.npz \
-        --autoencoder_dir data/models/autoencoder/latdim_sweep_20260604_153830
+        --dataset_path   data/regressor_dataset/wingbeat_regressor_dataset.npz \
+        --autoencoder_dir data/models/autoencoder/autoencoder_20260615_173008
 """
 
 import argparse
@@ -146,7 +146,7 @@ def _information_ceiling(X, y, traj_ids, n_pairs_max: int = 4000) -> dict:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.strip(),
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dataset_path",    default="data/wingbeat_regressor_dataset.npz")
+    p.add_argument("--dataset_path",    default="data/regressor_dataset/wingbeat_regressor_dataset.npz")
     p.add_argument("--autoencoder_dir", default="data/models/autoencoder",
                    help="Dir with val_indices.json (defines the regressor's val split).")
     p.add_argument("--ks", type=int, nargs="+", default=[1, 5, 10, 25, 50])

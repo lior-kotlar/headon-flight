@@ -1,7 +1,7 @@
 {
-    "data_dir": "data",
+    "data_dir": "data/regressor_dataset",
     "auto_build_dataset": true,
-    "autoencoder_model_dir": "data/models/autoencoder/latdim_sweep_20260604_153830/latent_dim_4",
+    "autoencoder_model_dir": "data/models/autoencoder/autoencoder_20260615_173008",
     "save_dir": "data/models/body_latent_regressor",
     "device": "auto",
     "random_seed": 42,

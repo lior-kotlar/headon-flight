@@ -16,7 +16,7 @@ Run from project root:
     python code/inspect_body_dynamics.py
     python code/inspect_body_dynamics.py --n_trajectories 8 --select longest
     python code/inspect_body_dynamics.py --trajectory_ids 12 47 103
-    python code/inspect_body_dynamics.py --dataset_path data/wingbeat_regressor_dataset_dim16_L69.npz
+    python code/inspect_body_dynamics.py --dataset_path data/regressor_dataset/wingbeat_regressor_dataset_dim16_L69.npz
 """
 
 import argparse
@@ -56,10 +56,10 @@ def _robust_thresholds(x: np.ndarray, k: float) -> tuple[float, float, float]:
 
 
 def _default_dataset_path() -> str:
-    cands = sorted(glob.glob("data/wingbeat_regressor_dataset_*.npz"))
+    cands = sorted(glob.glob("data/regressor_dataset/wingbeat_regressor_dataset_*.npz"))
     if not cands:
         raise FileNotFoundError(
-            "No data/wingbeat_regressor_dataset_*.npz found. Pass --dataset_path."
+            "No data/regressor_dataset/wingbeat_regressor_dataset_*.npz found. Pass --dataset_path."
         )
     return cands[-1]
 
@@ -134,7 +134,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.strip(),
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dataset_path", default=None,
-                   help="Regressor dataset npz (default: latest data/wingbeat_regressor_dataset_*.npz). "
+                   help="Regressor dataset npz (default: latest data/regressor_dataset/wingbeat_regressor_dataset_*.npz). "
                         "body_means is identical across latent dims, so any one works.")
     p.add_argument("--n_trajectories", type=int, default=6,
                    help="How many trajectories to plot (ignored if --trajectory_ids given).")

@@ -747,7 +747,7 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--regressor_dir",    default="data/models/body_latent_regressor")
     parser.add_argument("--autoencoder_dir",  default="data/models/autoencoder")
-    parser.add_argument("--dataset_path",     default="data/wingbeat_regressor_dataset.npz")
+    parser.add_argument("--dataset_path",     default="data/regressor_dataset/wingbeat_regressor_dataset.npz")
     parser.add_argument("--device",           default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--save_dir",         default=None,
                         help="Where to write the eval outputs. Default: <regressor_dir>/eval/")

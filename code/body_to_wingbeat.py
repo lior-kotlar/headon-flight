@@ -259,7 +259,7 @@ def main():
     parser = argparse.ArgumentParser(description="End-to-end body→wingbeat smoke-test eval.")
     parser.add_argument("--regressor_dir",    default="data/models/body_latent_regressor")
     parser.add_argument("--autoencoder_dir",  default="data/models/autoencoder")
-    parser.add_argument("--dataset_path",     default="data/wingbeat_regressor_dataset.npz")
+    parser.add_argument("--dataset_path",     default="data/regressor_dataset/wingbeat_regressor_dataset.npz")
     parser.add_argument("--device",           default="auto", choices=["auto", "cpu", "cuda"])
     args = parser.parse_args()
 

@@ -49,7 +49,7 @@ from transform_data import (
     single_wing_template_path,
     trajectory_asymmetry_score,
 )
-from process_data import PROCESSED_TRAIN_FLIGHT_DATA_DIR, _extract_features_and_targets
+from process_data import PROCESSED_DATA_DIR, _extract_features_and_targets, gather_condensed_h5
 
 
 def _resolve_model_dir(model_dir: str) -> str:
@@ -110,15 +110,15 @@ def _load_filtered_trajectories(
     used in transform_data.py:main(). Returns body and wing lists aligned with
     the post-filter trajectory indices.
     """
-    files = sorted(f for f in os.listdir(processed_dir) if f.endswith(".h5"))
-    if not files:
-        raise FileNotFoundError(f"No .h5 files found in {processed_dir}")
+    paths = gather_condensed_h5(processed_dir)   # recursive over per-experiment subdirs, path-sorted
+    if not paths:
+        raise FileNotFoundError(f"No .h5 files found under {processed_dir}")
 
     body_list: list[np.ndarray] = []
     wing_list: list[np.ndarray] = []
-    for fname in files:
+    for path in paths:
         body, wing = _extract_features_and_targets(
-            os.path.join(processed_dir, fname),
+            path,
             forces_indication_vector=None,   # None → no body-column filtering, full 12
             use_radians=use_radians,
         )
@@ -198,7 +198,7 @@ def build_regressor_dataset(
     *,
     model_dir: str,
     output: str,
-    processed_dir: str = PROCESSED_TRAIN_FLIGHT_DATA_DIR,
+    processed_dir: str = PROCESSED_DATA_DIR,
     template_path: str = "data/analysis/golden_template.npy",
     asymmetry_max_multiple: float = 10.0,
     device: str = "auto",
@@ -396,14 +396,14 @@ def build_regressor_dataset(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build body→latent regressor dataset.")
-    parser.add_argument("--processed_dir", default=PROCESSED_TRAIN_FLIGHT_DATA_DIR,
+    parser.add_argument("--processed_dir", default=PROCESSED_DATA_DIR,
                         help="Directory containing the processed H5 files.")
     parser.add_argument("--template_path", default="data/analysis/golden_template.npy",
                         help="Path to the golden wingbeat template .npy.")
     parser.add_argument("--model_dir", default="data/models/autoencoder",
                         help="Either a directory containing best_autoencoder.pt, "
                              "or a parent of run_<timestamp>/ subdirectories (latest is used).")
-    parser.add_argument("--output", default="data/wingbeat_regressor_dataset.npz",
+    parser.add_argument("--output", default="data/regressor_dataset/wingbeat_regressor_dataset.npz",
                         help="Output .npz file path.")
     parser.add_argument("--asymmetry_max_multiple", type=float, default=10.0,
                         help="Trajectories with asymmetry score > this × dataset-median are "

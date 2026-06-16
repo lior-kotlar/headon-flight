@@ -149,7 +149,7 @@ def plot_maneuver_buckets(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.strip(), formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--npz_path",      default="data/wingbeats_L80.npz")
+    parser.add_argument("--npz_path",      default="data/autoencoder_dataset/wingbeats_L69.npz")
     parser.add_argument("--template_path", default="data/analysis/golden_template.npy")
     parser.add_argument("--out_dir",       default=os.path.join("data", "analysis"),
                         help="Where to write maneuver_buckets_<axis>.png files. Default: data/analysis/")

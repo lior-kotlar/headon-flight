@@ -189,7 +189,7 @@ def _write_index_html(rows: list, out_path: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Visual screening for wing-angle trajectories")
-    parser.add_argument('--data_path', default='data/trajectories.npy', help='Path to trajectories .npy')
+    parser.add_argument('--data_path', default='data/autoencoder_dataset/trajectories.npy', help='Path to trajectories .npy')
     parser.add_argument('--out_dir',   default='data/analysis/trajectory_screening',
                         help='Output directory (PNGs + summary + index)')
     args = parser.parse_args()

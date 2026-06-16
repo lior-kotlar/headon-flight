@@ -9,7 +9,9 @@
 #SBATCH --mail-user=lior.kotlar@mail.huji.ac.il
 #SBATCH --mail-type=END,FAIL
 
-# Usage: sbatch -J <EXPERIMENT_NAME> sbatch_train_autoencoder.sh <CONFIG_PATH>
+# Usage: sbatch -J <EXPERIMENT_NAME> sbatch_train_autoencoder.sh <CONFIG_PATH> [extra autoencoder.py args]
+#   e.g. single-wing from the same config:
+#   sbatch -J ae_single_wing sbatch_train_autoencoder.sh code/autoencoder_config.json --representation single_wing
 CONFIG_PATH=$1
 
 # Safety checks
@@ -36,7 +38,8 @@ echo "GPUs allocated: $CUDA_VISIBLE_DEVICES"
 echo "Config File: $CONFIG_PATH"
 echo "Experiment Name: $SLURM_JOB_NAME"
 
-# Execute the autoencoder grid search
-python code/autoencoder.py --config "$CONFIG_PATH" --job_name "$SLURM_JOB_NAME"
+# Execute the autoencoder grid search (extra args after the config are forwarded,
+# e.g. --representation single_wing)
+python code/autoencoder.py --config "$CONFIG_PATH" --job_name "$SLURM_JOB_NAME" "${@:2}"
 
 echo "finished working"

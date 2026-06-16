@@ -1,7 +1,8 @@
 {
-    "data_path": "data/trajectories.npy",
-    "template_path": "data/analysis/golden_template.npy",
+    "data_path": "data/autoencoder_dataset/trajectories.npy",
+    "template_path": "data/autoencoder_dataset/golden_template.npy",
     "save_dir": "data/models/autoencoder",
+    "processed_dir": "data/processed",
     "fixed_len": 69,
     "auto_build_dataset": true,
     "post_training_bucket_eval_axes": ["all"],

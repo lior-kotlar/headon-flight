@@ -8,7 +8,7 @@ physical 3-vector (v, a, ω, α) is divided by its average L2 magnitude on the
 training set, preserving direction. The same 12-d scale factor is applied to
 both halves of the 24-d input so current/next channels stay directly comparable.
 
-Trains on data/wingbeat_regressor_dataset.npz produced by
+Trains on data/regressor_dataset/wingbeat_regressor_dataset.npz produced by
 code/data_handling/build_regressor_dataset.py. Train/val split is by
 trajectory_id, using val_indices.json from the autoencoder run, so the
 regressor's val set is wingbeats from trajectories the autoencoder also

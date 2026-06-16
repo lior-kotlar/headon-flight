@@ -1010,10 +1010,22 @@ def main():
         help="Name used as prefix for the per-run model and analysis directories. "
              "If unset/empty, defaults to 'run' (models) and 'gridsearch' (analysis).",
     )
+    parser.add_argument(
+        "--representation",
+        default=None,
+        help="Override the config's representation ('sa' or 'single_wing'). Lets one "
+             "config train either model. A non-'sa' representation auto-suffixes save_dir "
+             "(e.g. .../autoencoder → .../autoencoder_single_wing) so the "
+             "two models save to separate dirs.",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
         raw_config = json.load(f)
+
+    # CLI override: inject as a scalar so it flows through as a fixed (non-grid) value.
+    if args.representation:
+        raw_config['representation'] = args.representation
 
     # Keys whose values are lists are grid-searched; all others are fixed across every run.
     # Some keys hold *complex* values (lists/tuples) as a single unit — for those, a bare
@@ -1135,6 +1147,10 @@ def main():
 
     # Per-run model directory so previous checkpoints are never overwritten
     base_save_dir = fixed.get('save_dir', 'data/models/autoencoder')
+    # One config can train both representations: a non-'sa' representation gets a
+    # save_dir suffix so its runs land in their own dir rather than colliding with sa.
+    if representation != 'sa' and not base_save_dir.endswith(representation):
+        base_save_dir = f"{base_save_dir}_{representation}"
     save_dir      = os.path.join(base_save_dir, f"{models_prefix}_{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
 
