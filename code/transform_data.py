@@ -334,7 +334,27 @@ def generate_average_wingbeat_template(trajectories, template_res=100, plot_temp
             os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"Template plot saved to: {save_path}")
-            
+
+            # 3D wing-angle-space view of the template (next to the .png/.npy). The
+            # template is one representative wingbeat per wing, drawn as L/R loops.
+            # A missing plotly or render error must not break the template build.
+            try:
+                from wingbeat_angle_space import make_angle_space_figure, write_html, WING_COLORS
+                html_path = os.path.splitext(save_path)[0] + "_angle_space.html"
+                fig3d = make_angle_space_figure(
+                    loops=[
+                        dict(name="Left wing",  angles=template[:, 0:3], units="rad",
+                             color=WING_COLORS["left"],  markers=True, close=True, mark_start=True, width=5),
+                        dict(name="Right wing", angles=template[:, 3:6], units="rad",
+                             color=WING_COLORS["right"], markers=True, close=True, mark_start=True, width=5),
+                    ],
+                    title=f"Golden template — wing angle space (n_cycles={len(all_cycles)})",
+                )
+                write_html(fig3d, html_path)
+                logger.info(f"Template angle-space 3D plot saved → {html_path}")
+            except Exception as e:
+                logger.warning(f"Skipped template angle-space 3D plot: {e}")
+
         plt.show()
     
     return template
@@ -397,6 +417,19 @@ def generate_single_wing_template(trajectories, template_res=69, plot_template=T
             os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"Single-wing template plot saved to: {save_path}")
+
+            # 3D wing-angle-space view: one wing, one phase-colored loop. Guarded so a
+            # missing plotly or render error never breaks the template build.
+            try:
+                from wingbeat_angle_space import plot_single_wingbeat
+                html_path = os.path.splitext(save_path)[0] + "_angle_space.html"
+                plot_single_wingbeat(
+                    template3, html_path, units="rad", name="single-wing template",
+                    title=f"Single-wing golden template — wing angle space (n_cycles={len(all_cycles)})",
+                )
+                logger.info(f"Single-wing template angle-space 3D plot saved → {html_path}")
+            except Exception as e:
+                logger.warning(f"Skipped single-wing template angle-space 3D plot: {e}")
         plt.close(fig)
 
     return template3

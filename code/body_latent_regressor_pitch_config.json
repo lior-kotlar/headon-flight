@@ -1,7 +1,7 @@
 {
     "data_dir": "data/regressor_dataset",
     "auto_build_dataset": true,
-    "autoencoder_model_dir": "data/models/autoencoder/autoencoder_20260615_173008",
+    "autoencoder_model_dir": "data/models/autoencoder_single_wing/ae_sw_latsweep_20260617_174025/latent_dim_8",
     "save_dir": "data/models/body_latent_regressor",
     "feature_set": "pitch",
     "body_scaler": "standardize",

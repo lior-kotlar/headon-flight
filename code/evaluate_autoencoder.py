@@ -27,7 +27,12 @@ import os
 import numpy as np
 import torch
 
-from autoencoder import WingbeatAutoencoder, _plot_reconstructed_trajectory
+from autoencoder import (
+    WingbeatAutoencoder,
+    _plot_reconstructed_trajectory,
+    _plot_reconstructed_trajectory_single_wing,
+)
+from transform_data import single_wing_template_path
 from data_handling.bucket_eval import (
     evaluate_by_maneuver_bucket,
     plot_per_phase_error,
@@ -158,9 +163,14 @@ def main() -> None:
     val_trajs = _load_val_trajectories(model_dir, trajectories, config)
 
     # --- Rebuild the model from the checkpoint's architecture metadata ---
+    # The checkpoint carries its representation ('sa' = 6-ch, 'single_wing' = 3-ch) and
+    # in_channels; legacy checkpoints predate single-wing and default to 6-ch S/A.
+    representation = ckpt.get('representation', 'sa')
+    in_channels    = ckpt.get('in_channels', 6)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = WingbeatAutoencoder(
         latent_dim          = ckpt['latent_dim'],
+        in_channels         = in_channels,
         activation          = ckpt.get('activation', 'gelu'),
         dropout             = ckpt.get('dropout', 0.0),
         base_channels       = ckpt.get('base_channels', 128),       # legacy default
@@ -171,7 +181,8 @@ def main() -> None:
     model.load_state_dict(ckpt['state_dict'])
     model.to(device)
     print(
-        f"Loaded model: latent_dim={ckpt['latent_dim']} "
+        f"Loaded model: representation={representation} in_channels={in_channels} "
+        f"latent_dim={ckpt['latent_dim']} "
         f"activation={ckpt.get('activation', 'gelu')} val_loss={ckpt.get('val_loss', 'unknown')}",
         flush=True,
     )
@@ -183,7 +194,12 @@ def main() -> None:
     os.makedirs(save_dir, exist_ok=True)
 
     # --- Per-maneuver-bucket eval (default on; --no_bucket_eval to skip) ---
-    if not args.no_bucket_eval:
+    # The per-phase/per-bucket evals are S/A-only for now (they assume the 6-ch L/R
+    # angle layout), matching the gating in autoencoder.py's post-training eval.
+    if not args.no_bucket_eval and representation != 'sa':
+        print(f"Skipping bucket eval — only supported for representation='sa' "
+              f"(checkpoint is {representation!r}).", flush=True)
+    elif not args.no_bucket_eval:
         if args.npz_path is not None:
             npz_path = args.npz_path
         else:
@@ -238,15 +254,27 @@ def main() -> None:
         print(f"No --seed given; using random seed={seed}", flush=True)
 
     save_path = os.path.join(save_dir, f"reconstruction_seed{seed}.png")
-    _plot_reconstructed_trajectory(
-        model     = model,
-        val_trajs = val_trajs,
-        template  = template,
-        save_path = save_path,
-        device    = device,
-        n_beats   = args.n_beats,
-        seed      = seed,
-    )
+    if representation == 'single_wing':
+        template3 = np.load(single_wing_template_path(config['template_path']))
+        _plot_reconstructed_trajectory_single_wing(
+            model     = model,
+            val_trajs = val_trajs,
+            template3 = template3,
+            save_path = save_path,
+            device    = device,
+            n_beats   = args.n_beats,
+            seed      = seed,
+        )
+    else:
+        _plot_reconstructed_trajectory(
+            model     = model,
+            val_trajs = val_trajs,
+            template  = template,
+            save_path = save_path,
+            device    = device,
+            n_beats   = args.n_beats,
+            seed      = seed,
+        )
     print(f"\nDone. Plots saved in: {save_dir}", flush=True)
 
 

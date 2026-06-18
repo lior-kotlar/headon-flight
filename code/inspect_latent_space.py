@@ -44,7 +44,9 @@ Available analyses:
                         Writes one scatter per body angular-accel axis (yaw,
                         pitch, roll), each point colored on a continuous gradient
                         by the magnitude of that axis' acceleration
-                        (|body_means[:, 9/10/11]|). Shows whether high-maneuver
+                        (|body_means[:, 9/10/11]|), plus one "overall" scatter
+                        colored by the L2 norm across the three axes
+                        (‖body_means[:, 9:12]‖). Shows whether high-maneuver
                         wingbeats occupy a distinct region of latent space. The
                         color scale is clipped at --color_clip_pct (default p99)
                         because the angular accel is heavy-tailed.
@@ -59,6 +61,18 @@ Available analyses:
                         and percentile rank for each query vs z_mean. Saves
                         a z-score bar chart, a decoded-overlay PNG+HTML, and
                         a JSON sidecar.
+
+  angle_space           3D wing-angle-space (φ, θ, ψ) view for one wing — the
+                        decode side of the traversal, plotted in angle space
+                        instead of per-angle-vs-phase. Draws the val-set wingbeat
+                        point cloud, then for one (or more) example wingbeats
+                        overlays the ORIGINAL loop against its encode → traversal
+                        → decode loops: one figure per top-K latent dim and per
+                        top-K PC, each sweeping the example's z ± range_std·σ along
+                        that direction. Each wingbeat is a closed loop through
+                        (φ, θ, ψ); the sweep shows what each direction morphs about
+                        that loop, relative to where wingbeats actually live (the
+                        cloud). Interactive Plotly HTML, via wingbeat_angle_space.py.
 
   all                   Run every analysis.
 
@@ -94,6 +108,7 @@ from transform_data import (
     single_wing_template_path,
 )
 from data_handling.bucket_eval import _reconstruct_wing_angles_from_normalized_sa
+from wingbeat_angle_space import make_angle_space_figure, make_angle_space_2d_figure, write_html
 
 
 # The three wing angles, in row order. Which channel column holds each angle for a
@@ -147,6 +162,7 @@ _ANALYSIS_CHOICES = (
     "template_vs_mean",
     "pca",
     "pca_3d",
+    "angle_space",
     "all",
 )
 
@@ -174,6 +190,25 @@ def _load_model(model_dir: str, device: str):
     model.load_state_dict(ckpt["state_dict"])
     model.to(device).eval()
     return model, ckpt
+
+
+def _encode_in_batches(
+    model:      WingbeatAutoencoder,
+    sa_all:     torch.Tensor,        # (N, C, L) on CPU
+    device:     str,
+    batch_size: int = 4096,
+) -> torch.Tensor:
+    """
+    Encode (N, C, L) wingbeats to (N, latent_dim) in chunks, keeping only one batch
+    of conv activations resident at a time. Latents (tiny) are returned on `device`
+    so downstream decode/traversal code can mix them with device tensors freely.
+    """
+    zs = []
+    with torch.no_grad():
+        for start in range(0, sa_all.shape[0], batch_size):
+            batch = sa_all[start:start + batch_size].to(device)
+            zs.append(model.encode(batch))
+    return torch.cat(zs, dim=0)
 
 
 def _load_inputs(model_dir: str, device: str, npz_path_override: str | None):
@@ -211,7 +246,7 @@ def _load_inputs(model_dir: str, device: str, npz_path_override: str | None):
 
     d          = np.load(npz_path)
     sa_all_np  = d[array_key]                                                  # (N, C, L)
-    sa_all     = torch.from_numpy(sa_all_np).float().to(device)
+    sa_all     = torch.from_numpy(sa_all_np).float()                          # kept on CPU
     n_val      = sa_all.shape[0]
     print(
         f"Loaded model: representation={representation}, latent_dim={latent_dim}, "
@@ -219,10 +254,13 @@ def _load_inputs(model_dir: str, device: str, npz_path_override: str | None):
         flush=True,
     )
 
-    with torch.no_grad():
-        z_all  = model.encode(sa_all)                                          # (N, latent_dim)
-        z_mean = z_all.mean(dim=0)
-        z_std  = z_all.std (dim=0)
+    # Encode in mini-batches. A single forward pass over all N wingbeats materializes
+    # conv activations of shape (N, base_channels, L) per layer — several GB at the
+    # single-wing N (~2× the S/A count, since left+right are separate rows) — which
+    # trips the OOM killer. Batch + move to device per chunk to bound peak memory.
+    z_all  = _encode_in_batches(model, sa_all, device)                        # (N, latent_dim)
+    z_mean = z_all.mean(dim=0)
+    z_std  = z_all.std (dim=0)
 
     return {
         "model":          model,
@@ -866,6 +904,18 @@ def run_pca_3d(
         )
         print(f"  → wrote {out_path}", flush=True)
 
+    # Plus one "overall" scatter: the L2 norm of the angular-accel vector across
+    # all three axes, so wingbeats maneuvering hard on *any* axis light up.
+    accel_cols   = [col for _, col in _ANGULAR_ACCEL_AXES]
+    overall_mag  = np.linalg.norm(body_means[:, accel_cols].astype(np.float64), axis=1)  # (N,)
+    out_path = os.path.join(out_dir, f"{lat_prefix}pca_scatter_3d_overall.html")
+    _plot_pca_scatter_3d_plotly(
+        coords=coords, color_scalar=overall_mag, axis_name="overall",
+        expl_ratio=pca["explained_ratio"], color_clip_pct=color_clip_pct,
+        n_wingbeats=pca["n_wingbeats"], out_path=out_path,
+    )
+    print(f"  → wrote {out_path}", flush=True)
+
 
 # ---------------------------------------------------------------------------
 # Analysis: template vs mean
@@ -1159,6 +1209,226 @@ def run_template_vs_mean(
 
 
 # ---------------------------------------------------------------------------
+# Analysis: angle_space (3D wing-angle-space overlay of encode→traverse→decode)
+# ---------------------------------------------------------------------------
+
+
+def _val_cloud_wingbeats(
+    sa_all_np:     np.ndarray,    # (N, C, L) normalized channels
+    repr_plot:     dict,
+    max_wingbeats: int,
+    seed:          int,
+) -> list[np.ndarray]:
+    """
+    Reconstruct val wingbeats back to (L, 3) angle-space loops (radians), one per
+    wing, to form the background point cloud. Optionally subsample to at most
+    `max_wingbeats` source wingbeats (keeps the cloud — and the embedded HTML —
+    light); the per-figure point cap in make_angle_space_figure thins it further.
+    """
+    reconstruct = repr_plot["reconstruct"]
+    template_L  = repr_plot["template_L"]
+    wings       = repr_plot["wings"]
+    N = sa_all_np.shape[0]
+    if max_wingbeats and N > max_wingbeats:
+        rng = np.random.default_rng(seed)
+        idx = np.sort(rng.choice(N, size=max_wingbeats, replace=False))
+    else:
+        idx = np.arange(N)
+    cloud: list[np.ndarray] = []
+    for i in idx:
+        wing_angles = reconstruct(sa_all_np[i], template_L)        # (L, C) rad
+        for _, cols in wings:
+            cloud.append(wing_angles[:, cols])                     # (L, 3) rad
+    return cloud
+
+
+def _coolwarm_rgb(n: int) -> list[str]:
+    """n Plotly 'rgb(...)' strings sampled across coolwarm (cool = −σ, warm = +σ)."""
+    rgba = plt.get_cmap("coolwarm")(np.linspace(0.0, 1.0, n))
+    return [f"rgb({int(r * 255)},{int(g * 255)},{int(b * 255)})" for r, g, b, _ in rgba]
+
+
+def _select_examples(
+    z_all:    torch.Tensor,    # (N, latent_dim)
+    z_mean:   torch.Tensor,    # (latent_dim,)
+    n:        int,
+    explicit: list[int] | None,
+) -> list[int]:
+    """
+    Pick example-wingbeat row indices. If `explicit` is given, use it verbatim.
+    Otherwise rank by distance to the centroid and spread the picks across that
+    distribution (the closest = most typical, then quantiles out to near-extreme),
+    so a multi-example run shows typical → unusual wingbeats.
+    """
+    if explicit:
+        return [int(x) for x in explicit]
+    d = (z_all - z_mean).norm(dim=1)
+    order = torch.argsort(d).cpu().numpy()            # ascending: typical first
+    if n <= 1:
+        return [int(order[0])]
+    qs = np.linspace(0.0, 0.99, n)
+    picks = [int(order[min(len(order) - 1, int(q * (len(order) - 1)))]) for q in qs]
+    seen, out = set(), []
+    for p in picks:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _angle_space_overlay(
+    cloud_wbs:    list[np.ndarray],
+    orig_angles:  np.ndarray,        # (L, C) rad — the example's true wing angles
+    sweep:        list[tuple],       # [(label, color, width, recon_angles (L, C)), ...]
+    repr_plot:    dict,
+    title:        str,
+    out_path:     str,
+    cloud_points: int,
+) -> None:
+    """
+    One angle-space figure: background cloud + the original wingbeat loop (bold
+    black, start-marked) + each decoded sweep step as a colored loop. For the
+    single-wing representation there is one loop per entry; for S/A both wings are
+    drawn (named with their wing).
+    """
+    wings  = repr_plot["wings"]
+    single = len(wings) == 1
+    loops: list[dict] = []
+    for wing_title, cols in wings:
+        loops.append(dict(
+            name=("original" if single else f"original {wing_title}"),
+            angles=orig_angles[:, cols], units="rad", color="black",
+            width=6, markers=True, marker_size=3, mark_start=True, close=True,
+        ))
+    for label, color, width, recon_angles in sweep:
+        for wing_title, cols in wings:
+            loops.append(dict(
+                name=(label if single else f"{wing_title} {label}"),
+                angles=recon_angles[:, cols], units="rad", color=color,
+                width=width, markers=False, close=True,
+            ))
+    fig = make_angle_space_figure(
+        cloud=cloud_wbs, units="rad", loops=loops, title=title,
+        cloud_max_points=cloud_points, cloud_opacity=0.15, cloud_marker_size=2,
+    )
+    write_html(fig, out_path)
+
+    # Companion 2D file (same cloud + original + traversal): ψ-vs-φ and θ-vs-φ
+    # panels in one figure, written next to the 3D html as <name>_2d.html.
+    fig2d = make_angle_space_2d_figure(
+        cloud=cloud_wbs, units="rad", loops=loops,
+        title=f"{title} — 2D (ψ–φ, θ–φ)", panels=((0, 2), (0, 1)),
+        cloud_max_points=cloud_points, cloud_opacity=0.15, cloud_marker_size=3,
+    )
+    write_html(fig2d, out_path[:-len(".html")] + "_2d.html")
+
+
+def run_angle_space(
+    out_dir:         str,
+    lat_prefix:      str,
+    model:           WingbeatAutoencoder,
+    repr_plot:       dict,
+    sa_all:          torch.Tensor,
+    z_all:           torch.Tensor,
+    z_mean:          torch.Tensor,
+    z_std:           torch.Tensor,
+    latent_dim:      int,
+    n_steps:         int,
+    range_std:       float,
+    device:          str,
+    n_examples:      int,
+    example_indices: list[int] | None,
+    cloud_wingbeats: int,
+    cloud_points:    int,
+    top_k:           int,
+    seed:            int,
+) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    sa_all_np   = sa_all.detach().cpu().numpy()
+    reconstruct = repr_plot["reconstruct"]
+    template_L  = repr_plot["template_L"]
+
+    cloud_wbs = _val_cloud_wingbeats(sa_all_np, repr_plot, cloud_wingbeats, seed)
+    print(f"  built background cloud from up to {cloud_wingbeats} wingbeats "
+          f"({len(cloud_wbs)} loops).", flush=True)
+
+    pca  = _compute_pca(z_all, z_mean)
+    n_pc = len(pca["sigma_pc"])
+
+    # Which directions to sweep. top_k > 0 limits to the most-active latent dims
+    # (by std) and the top PCs (by explained variance) so the HTML count stays
+    # bounded; top_k = 0 sweeps every dim and every PC.
+    if top_k and top_k > 0:
+        dim_list = [int(d) for d in torch.argsort(z_std, descending=True).cpu().numpy()[:top_k]]
+        pc_list  = list(range(min(top_k, n_pc)))
+    else:
+        dim_list = list(range(latent_dim))
+        pc_list  = list(range(n_pc))
+
+    idxs     = _select_examples(z_all, z_mean, n_examples, example_indices)
+    deltas   = torch.linspace(-range_std, range_std, n_steps, device=device)
+    deltas_np = deltas.detach().cpu().numpy()
+    colors   = _coolwarm_rgb(n_steps)
+    mid      = n_steps // 2
+
+    def _sweep_from_recon(recon: np.ndarray) -> list[tuple]:
+        # recon: (n_steps, C, L) → list of (label, color, width, (L, C) rad).
+        return [
+            (f"{deltas_np[s]:+.1f}σ", colors[s], (4.5 if s == mid else 2.5),
+             reconstruct(recon[s], template_L))
+            for s in range(n_steps)
+        ]
+
+    for rank, i in enumerate(idxs):
+        z0          = z_all[i]
+        orig_angles = reconstruct(sa_all_np[i], template_L)                # (L, C) rad
+        ex_dir = os.path.join(out_dir, f"{lat_prefix}example_{rank:02d}_idx{i}")
+        os.makedirs(ex_dir, exist_ok=True)
+
+        # Overview: original vs its own reconstruction decode(z0) — AE fidelity.
+        with torch.no_grad():
+            recon0 = model.decode(z0.unsqueeze(0)).cpu().numpy()[0]        # (C, L)
+        _angle_space_overlay(
+            cloud_wbs, orig_angles,
+            [("reconstruction", "mediumseagreen", 4.0, reconstruct(recon0, template_L))],
+            repr_plot,
+            f"Angle space — example idx {i}: original vs reconstruction",
+            os.path.join(ex_dir, "overview.html"), cloud_points,
+        )
+
+        # Latent-dim sweeps: hold all other dims at the example's z, vary dim k.
+        for k in dim_list:
+            z_sweep = z0.unsqueeze(0).repeat(n_steps, 1).clone()
+            z_sweep[:, k] = z0[k] + deltas * z_std[k]
+            with torch.no_grad():
+                recon = model.decode(z_sweep).cpu().numpy()
+            _angle_space_overlay(
+                cloud_wbs, orig_angles, _sweep_from_recon(recon), repr_plot,
+                f"Angle space — example idx {i}, latent dim {k} sweep "
+                f"(±{range_std:.0f}σ, z_std={float(z_std[k]):.3f})",
+                os.path.join(ex_dir, f"dim_{k:03d}.html"), cloud_points,
+            )
+
+        # PC sweeps: move the example's z along principal component k.
+        for k in pc_list:
+            component = torch.from_numpy(pca["components"][k]).to(device=device, dtype=z0.dtype)
+            sigma_k   = float(pca["sigma_pc"][k])
+            z_sweep   = z0.unsqueeze(0).repeat(n_steps, 1).clone()
+            z_sweep  += (deltas * sigma_k).unsqueeze(1) * component.unsqueeze(0)
+            with torch.no_grad():
+                recon = model.decode(z_sweep).cpu().numpy()
+            _angle_space_overlay(
+                cloud_wbs, orig_angles, _sweep_from_recon(recon), repr_plot,
+                f"Angle space — example idx {i}, PC {k} sweep "
+                f"({100 * pca['explained_ratio'][k]:.1f}% var)",
+                os.path.join(ex_dir, f"pc_{k:03d}.html"), cloud_points,
+            )
+
+        print(f"  → wrote {ex_dir}  (overview + {len(dim_list)} dim + {len(pc_list)} pc sweeps)",
+              flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -1190,6 +1460,21 @@ def main() -> None:
     parser.add_argument("--color_clip_pct", type=float, default=99.0,
                         help="pca_3d: clip the pitch-accel color scale at this percentile "
                              "so the heavy tail doesn't wash out the gradient (default: 99).")
+    # angle_space-specific
+    parser.add_argument("--angle_space_n_examples", type=int, default=1,
+                        help="angle_space: how many example wingbeats to overlay (default: 1, the "
+                             "most typical = closest to z_mean). >1 spreads picks typical→unusual.")
+    parser.add_argument("--angle_space_example_indices", type=int, nargs="+", default=None,
+                        help="angle_space: explicit npz row indices to use as examples "
+                             "(overrides --angle_space_n_examples).")
+    parser.add_argument("--angle_space_top_k", type=int, default=4,
+                        help="angle_space: sweep only the top-K latent dims (by std) and top-K PCs "
+                             "(by explained var) to bound the HTML count. 0 = every dim and PC. Default: 4.")
+    parser.add_argument("--angle_space_cloud_wingbeats", type=int, default=4000,
+                        help="angle_space: max source wingbeats reconstructed into the background "
+                             "cloud (default: 4000). Keeps the embedded HTML light.")
+    parser.add_argument("--angle_space_cloud_points", type=int, default=8000,
+                        help="angle_space: max cloud points actually plotted per figure (default: 8000).")
     args = parser.parse_args()
 
     device = args.device
@@ -1267,6 +1552,23 @@ def main() -> None:
             z_all=ctx["z_all"], z_mean=ctx["z_mean"],
             latent_dim=ctx["latent_dim"],
             n_samples=args.n_samples, device=device, seed=args.sampling_seed,
+        )
+
+    if "angle_space" in requested:
+        print("\n[angle_space]", flush=True)
+        run_angle_space(
+            out_dir=os.path.join(out_root, "angle_space"),
+            lat_prefix=ctx["lat_prefix"],
+            model=ctx["model"], repr_plot=ctx["repr_plot"],
+            sa_all=ctx["sa_all"], z_all=ctx["z_all"],
+            z_mean=ctx["z_mean"], z_std=ctx["z_std"],
+            latent_dim=ctx["latent_dim"],
+            n_steps=args.n_steps, range_std=args.range_std, device=device,
+            n_examples=args.angle_space_n_examples,
+            example_indices=args.angle_space_example_indices,
+            cloud_wingbeats=args.angle_space_cloud_wingbeats,
+            cloud_points=args.angle_space_cloud_points,
+            top_k=args.angle_space_top_k, seed=args.sampling_seed,
         )
 
     print(f"\nDone. Outputs in: {out_root}", flush=True)
