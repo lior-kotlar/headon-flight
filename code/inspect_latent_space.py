@@ -1284,22 +1284,26 @@ def _angle_space_overlay(
     title:        str,
     out_path:     str,
     cloud_points: int,
+    include_original: bool = True,
 ) -> None:
     """
-    One angle-space figure: background cloud + the original wingbeat loop (bold
-    black, start-marked) + each decoded sweep step as a colored loop. For the
-    single-wing representation there is one loop per entry; for S/A both wings are
-    drawn (named with their wing).
+    One angle-space figure: background cloud + each decoded sweep step as a colored
+    loop, and (when include_original) the measured wingbeat as a bold black,
+    start-marked loop. For the single-wing representation there is one loop per
+    entry; for S/A both wings are drawn (named with their wing). The dim/PC sweeps
+    pass include_original=False — their +0σ step already shows the centered
+    reconstruction (drawn black), so the measured loop would only clutter them.
     """
     wings  = repr_plot["wings"]
     single = len(wings) == 1
     loops: list[dict] = []
-    for wing_title, cols in wings:
-        loops.append(dict(
-            name=("original" if single else f"original {wing_title}"),
-            angles=orig_angles[:, cols], units="rad", color="black",
-            width=6, markers=True, marker_size=3, mark_start=True, close=True,
-        ))
+    if include_original:
+        for wing_title, cols in wings:
+            loops.append(dict(
+                name=("original" if single else f"original {wing_title}"),
+                angles=orig_angles[:, cols], units="rad", color="black",
+                width=6, markers=True, marker_size=3, mark_start=True, close=True,
+            ))
     for label, color, width, recon_angles in sweep:
         for wing_title, cols in wings:
             loops.append(dict(
@@ -1355,6 +1359,10 @@ def run_angle_space(
     pca  = _compute_pca(z_all, z_mean)
     n_pc = len(pca["sigma_pc"])
 
+    # Per-file prefix carrying the latent dim, so an HTML keeps its identity once
+    # it leaves its example_ dir (e.g. lat4_dim_000.html, lat4_dim_000_2d.html).
+    file_prefix = f"lat{latent_dim}_"
+
     # Which directions to sweep. top_k > 0 limits to the most-active latent dims
     # (by std) and the top PCs (by explained variance) so the HTML count stays
     # bounded; top_k = 0 sweeps every dim and every PC.
@@ -1372,9 +1380,12 @@ def run_angle_space(
     mid      = n_steps // 2
 
     def _sweep_from_recon(recon: np.ndarray) -> list[tuple]:
-        # recon: (n_steps, C, L) → list of (label, color, width, (L, C) rad).
+        # recon: (n_steps, C, L) → list of (label, color, width, (L, C) rad). The
+        # +0σ step is the centered reconstruction decode(z0); draw it bold black,
+        # the rest keep their coolwarm color.
         return [
-            (f"{deltas_np[s]:+.1f}σ", colors[s], (4.5 if s == mid else 2.5),
+            (f"{deltas_np[s]:+.1f}σ", ("black" if s == mid else colors[s]),
+             (4.5 if s == mid else 2.5),
              reconstruct(recon[s], template_L))
             for s in range(n_steps)
         ]
@@ -1393,7 +1404,7 @@ def run_angle_space(
             [("reconstruction", "mediumseagreen", 4.0, reconstruct(recon0, template_L))],
             repr_plot,
             f"Angle space — example idx {i}: original vs reconstruction",
-            os.path.join(ex_dir, "overview.html"), cloud_points,
+            os.path.join(ex_dir, f"{file_prefix}overview.html"), cloud_points,
         )
 
         # Latent-dim sweeps: hold all other dims at the example's z, vary dim k.
@@ -1406,7 +1417,8 @@ def run_angle_space(
                 cloud_wbs, orig_angles, _sweep_from_recon(recon), repr_plot,
                 f"Angle space — example idx {i}, latent dim {k} sweep "
                 f"(±{range_std:.0f}σ, z_std={float(z_std[k]):.3f})",
-                os.path.join(ex_dir, f"dim_{k:03d}.html"), cloud_points,
+                os.path.join(ex_dir, f"{file_prefix}dim_{k:03d}.html"), cloud_points,
+                include_original=False,
             )
 
         # PC sweeps: move the example's z along principal component k.
@@ -1421,7 +1433,8 @@ def run_angle_space(
                 cloud_wbs, orig_angles, _sweep_from_recon(recon), repr_plot,
                 f"Angle space — example idx {i}, PC {k} sweep "
                 f"({100 * pca['explained_ratio'][k]:.1f}% var)",
-                os.path.join(ex_dir, f"pc_{k:03d}.html"), cloud_points,
+                os.path.join(ex_dir, f"{file_prefix}pc_{k:03d}.html"), cloud_points,
+                include_original=False,
             )
 
         print(f"  → wrote {ex_dir}  (overview + {len(dim_list)} dim + {len(pc_list)} pc sweeps)",
@@ -1467,7 +1480,7 @@ def main() -> None:
     parser.add_argument("--angle_space_example_indices", type=int, nargs="+", default=None,
                         help="angle_space: explicit npz row indices to use as examples "
                              "(overrides --angle_space_n_examples).")
-    parser.add_argument("--angle_space_top_k", type=int, default=4,
+    parser.add_argument("--angle_space_top_k", type=int, default=0,
                         help="angle_space: sweep only the top-K latent dims (by std) and top-K PCs "
                              "(by explained var) to bound the HTML count. 0 = every dim and PC. Default: 4.")
     parser.add_argument("--angle_space_cloud_wingbeats", type=int, default=4000,

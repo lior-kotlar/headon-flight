@@ -162,7 +162,7 @@ def make_angle_space_figure(
     cloud_max_points: int = 20000,
     cloud_opacity: float = 0.25,
     cloud_marker_size: int = 2,
-    aspectmode: str = "cube",
+    aspectmode: str = "data",
     width: int = 1000,
     height: int = 850,
     seed: int = 0,
@@ -173,8 +173,9 @@ def make_angle_space_figure(
     dicts, see _loop_trace). Returns a plotly Figure; the caller saves it.
 
     The cloud is subsampled to `cloud_max_points` for render speed. `aspectmode`
-    defaults to 'cube' because the deviation θ range is much smaller than φ/ψ, so
-    equal-data scaling would flatten the manifold onto a pane.
+    defaults to 'data' (equal scale on all axes, so loop geometry is undistorted);
+    note the deviation θ range is much smaller than φ/ψ, so the manifold renders as
+    a thin slab. Pass aspectmode='cube' to fill the box instead.
     """
     go = _import_plotly()
     fig = go.Figure()
@@ -372,7 +373,11 @@ def make_angle_space_2d_figure(
         for spec in (loops or []):
             _add_loop_2d(go, fig, 1, ci, spec, units, xi, yi, showlegend=first)
         fig.update_xaxes(title_text=ANGLE_AXIS_TITLES[xi], row=1, col=ci)
-        fig.update_yaxes(title_text=ANGLE_AXIS_TITLES[yi], row=1, col=ci)
+        # Equal axes: 1 unit on y == 1 unit on x for this panel, so loop geometry
+        # is undistorted. scaleanchor must name the panel's own x axis (x, x2, …).
+        xref = "x" if ci == 1 else f"x{ci}"
+        fig.update_yaxes(title_text=ANGLE_AXIS_TITLES[yi], scaleanchor=xref,
+                         scaleratio=1, row=1, col=ci)
 
     fig.update_layout(
         title=title, width=width, height=height, template="plotly_white",
