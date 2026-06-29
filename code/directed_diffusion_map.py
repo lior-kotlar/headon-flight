@@ -18,9 +18,9 @@ dependency, so the exact same code path runs on a CPU dev node and a SLURM GPU
 node — only the `device` differs.
 
 Pipeline (all device-resident where possible):
-    1. build_augmented_features : flatten + weight kinematics, derivative penalty
-       and cycle penalty into one 2D matrix whose plain squared-L2 distance equals
-       the custom diffusion metric. (No epsilon here — see step 3.)
+    1. build_features          : flatten the wingbeat samples into one 2D matrix
+       (N, C*T) whose plain squared-L2 distance is the diffusion metric — no
+       derivative/cycle/endpoint penalties. (No epsilon here — see step 3.)
     2. knn                      : exact k-NN via a chunked brute-force matmul that
        never materialises the full N*N distance matrix (peak memory O(chunk*N)).
     3. build_sparse_operator    : pick the kernel bandwidth epsilon (auto = median
@@ -30,13 +30,13 @@ Pipeline (all device-resident where possible):
        GPU, scipy.sparse.linalg.eigsh fallback), drop the trivial constant mode,
        return the diffusion coordinates lambda_i * psi_i for the next k modes.
 
-Why squared-L2 == diffusion metric: every additive penalty in step 1 is folded
-into the feature vector as sqrt(weight) * component, so ||a-b||^2 reproduces the
-weighted sum of squared component differences. Epsilon is applied later (step 3)
-as a single global scalar; since it is monotonic it never changes k-NN ranking,
-which is what lets the bandwidth be chosen *from* the k-NN distances.
+Why squared-L2 == diffusion metric: the feature vector is just the flattened
+wingbeat samples (optionally per-channel rescaled), so ||a-b||^2 is the plain sum
+of squared sample differences. Epsilon is applied later (step 3) as a single
+global scalar; since it is monotonic it never changes k-NN ranking, which is what
+lets the bandwidth be chosen *from* the k-NN distances.
 
-Auto-epsilon: in the high-dimensional augmented space the squared distances are
+Auto-epsilon: in this high-dimensional sample space the squared distances are
 large, so a fixed epsilon=1 makes exp(-d^2) underflow to 0 and the graph
 disconnects. Setting epsilon=None (the default) picks epsilon = median of the
 non-self k-NN squared distances, so the typical neighbour affinity lands near
@@ -66,17 +66,14 @@ import torch
 class DDMConfig:
     """All tunables for the wing-only diffusion map.
 
-    The penalty weights are *variances* (they multiply squared differences); the
-    builder folds sqrt(weight) into the feature matrix so plain L2 reproduces them.
+    The metric is plain squared-L2 over the flattened wingbeat samples; the only
+    feature-space option is per-channel rescaling (equalize_channels / channel_weights)
+    so the three angles can be made to contribute equally rather than θ dominating.
     """
     # --- feature-construction weights ---
     channel_weights: tuple[float, float, float] = (1.0, 1.0, 1.0)  # per (phi,theta,psi); e.g. (3,3,10)
     equalize_channels: bool = False    # if True, divide each channel by its own std first so the
                                        # three angles contribute equally (channel_weights then bias on top)
-    endpoint_steps: int = 5            # first/last N time steps get extra weight
-    endpoint_weight: float = 5.0       # variance multiplier on those steps
-    derivative_weight: float = 0.1     # variance multiplier on the finite-diff derivative
-    cycle_weight: float = 0.02         # variance multiplier on the start-vs-end gap
 
     # --- kernel bandwidth ---
     epsilon: float | None = None       # None -> auto (median sq. k-NN distance); else a fixed value
@@ -111,26 +108,22 @@ class DDMResult:
 
 
 # --------------------------------------------------------------------------- #
-# Step 1 — Augmented feature matrix                                           #
+# Step 1 — Feature matrix (flattened wingbeat samples)                         #
 # --------------------------------------------------------------------------- #
-def build_augmented_features(
+def build_features(
     X: torch.Tensor,
     cfg: DDMConfig,
 ) -> torch.Tensor:
-    """Build the (N, D) augmented matrix whose squared-L2 == the diffusion metric.
+    """Flatten the wingbeat samples into the (N, C*T) feature matrix.
 
     X : (N, C, T) wing kinematics (C channels, T time steps).
 
-    The metric is built from the wing angles alone — body kinematics never enter
-    it. If cfg.equalize_channels, each channel is first divided by its own dataset
-    std so the three angles contribute equally (otherwise the widest-swing channel,
-    here θ, dominates the L2 distance); channel_weights then bias on top. Components
-    concatenated along the feature axis:
-      * Base kinematics  : X, per-channel weighted by sqrt(channel_weights) and with
-                           the first/last `endpoint_steps` time steps weighted by
-                           sqrt(endpoint_weight). -> C*T dims.
-      * Derivative       : finite-diff dX/dt, * sqrt(derivative_weight). -> C*(T-1) dims.
-      * Cycle gap        : X[...,0] - X[...,-1], * sqrt(cycle_weight). -> C dims.
+    The diffusion metric is plain squared-L2 over the raw wingbeat samples alone —
+    no derivative, cycle, or endpoint penalties, and no body kinematics. The only
+    feature-space transform is optional per-channel rescaling: if
+    cfg.equalize_channels each channel is first divided by its own dataset std so
+    the three angles contribute equally (otherwise the widest-swing channel, here
+    θ, dominates the L2 distance); channel_weights then bias on top. -> C*T dims.
 
     Epsilon is NOT applied here; it is a single global scalar folded in at the
     affinity step (step 3), which keeps k-NN ranking independent of bandwidth.
@@ -153,33 +146,15 @@ def build_augmented_features(
         raise ValueError(f"channel_weights has {chan_w.numel()} entries but X has {C} channels")
     chan_scale = chan_w.sqrt().view(1, C, 1)                   # (1, C, 1)
 
-    # --- temporal endpoint weighting ---
-    time_scale = torch.ones(T, dtype=dtype, device=device)     # (T,)
-    e = min(cfg.endpoint_steps, T)
-    if e > 0 and cfg.endpoint_weight != 1.0:
-        w = float(cfg.endpoint_weight) ** 0.5
-        time_scale[:e] = w
-        time_scale[T - e:] = w
-    time_scale = time_scale.view(1, 1, T)                      # (1, 1, T)
-
-    base = (X * chan_scale * time_scale).reshape(N, C * T)     # (N, C*T)
-
-    # --- derivative penalty (finite difference of raw X) ---
-    dX = (X[:, :, 1:] - X[:, :, :-1]) * (cfg.derivative_weight ** 0.5)
-    deriv = dX.reshape(N, C * (T - 1))                         # (N, C*(T-1))
-
-    # --- cycle penalty (start vs end of the wingbeat) ---
-    cycle = (X[:, :, 0] - X[:, :, -1]) * (cfg.cycle_weight ** 0.5)  # (N, C)
-
-    aug = torch.cat([base, deriv, cycle], dim=1)               # (N, D)
-    return aug.contiguous()
+    feats = (X * chan_scale).reshape(N, C * T)                 # (N, C*T)
+    return feats.contiguous()
 
 
 # --------------------------------------------------------------------------- #
 # Step 2 — Sparse k-NN graph (chunked, pure torch, device-agnostic)          #
 # --------------------------------------------------------------------------- #
-def knn(aug: torch.Tensor, cfg: DDMConfig) -> tuple[torch.Tensor, torch.Tensor]:
-    """Exact k-NN, fully on aug.device, via chunked brute force.
+def knn(feats: torch.Tensor, cfg: DDMConfig) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact k-NN, fully on feats.device, via chunked brute force.
 
     Uses ||a-b||^2 = ||a||^2 + ||b||^2 - 2 a.b so the heavy step is one matmul per
     query chunk; peak extra memory is O(chunk * N), never the full N*N matrix.
@@ -187,17 +162,17 @@ def knn(aug: torch.Tensor, cfg: DDMConfig) -> tuple[torch.Tensor, torch.Tensor]:
     Returns (dist2 (N,k), idx (N,k)) sorted nearest-first. Each point's own nearest
     neighbour is itself with distance 0 (kept; masked out where it matters).
     """
-    n = aug.shape[0]
+    n = feats.shape[0]
     k = min(cfg.k, n)
-    sq = (aug * aug).sum(dim=1)                                # (N,)
-    dist2 = aug.new_empty((n, k))
-    idx = torch.empty((n, k), dtype=torch.long, device=aug.device)
+    sq = (feats * feats).sum(dim=1)                            # (N,)
+    dist2 = feats.new_empty((n, k))
+    idx = torch.empty((n, k), dtype=torch.long, device=feats.device)
 
     for s in range(0, n, cfg.knn_chunk):
         e = min(s + cfg.knn_chunk, n)
-        q = aug[s:e]                                           # (c, D)
+        q = feats[s:e]                                         # (c, D)
         # (c, N): squared distances from each query to all points.
-        d2 = sq.unsqueeze(0) + (q * q).sum(1, keepdim=True) - 2.0 * (q @ aug.t())
+        d2 = sq.unsqueeze(0) + (q * q).sum(1, keepdim=True) - 2.0 * (q @ feats.t())
         d2.clamp_(min=0.0)
         vals, ids = torch.topk(d2, k, dim=1, largest=False, sorted=True)
         dist2[s:e] = vals
@@ -396,10 +371,10 @@ def directed_diffusion_map(X: torch.Tensor, cfg: DDMConfig) -> DDMResult:
     """Run the full wing-only diffusion-map pipeline on X and return a DDMResult."""
     n = X.shape[0]
 
-    aug = build_augmented_features(X, cfg)
-    print(f"[ddm] augmented features: {tuple(aug.shape)} on {aug.device}", flush=True)
+    feats = build_features(X, cfg)
+    print(f"[ddm] features: {tuple(feats.shape)} on {feats.device}", flush=True)
 
-    dist2, idx = knn(aug, cfg)
+    dist2, idx = knn(feats, cfg)
     print(f"[ddm] kNN: k={dist2.shape[1]}  dist2 range "
           f"[{dist2.min().item():.4g}, {dist2.max().item():.4g}]", flush=True)
 
@@ -432,7 +407,7 @@ def directed_diffusion_map(X: torch.Tensor, cfg: DDMConfig) -> DDMResult:
         trivial_eigenvalue=trivial,
         epsilon=epsilon,
         backend_eig=eig_backend,
-        extra={"n": n, "n_features": aug.shape[1]},
+        extra={"n": n, "n_features": feats.shape[1]},
     )
 
 
@@ -484,10 +459,6 @@ def save_result(
             "k":                 int(cfg.k),
             "channel_weights":   list(cfg.channel_weights),
             "equalize_channels": bool(cfg.equalize_channels),
-            "endpoint_steps":    int(cfg.endpoint_steps),
-            "endpoint_weight":   float(cfg.endpoint_weight),
-            "derivative_weight": float(cfg.derivative_weight),
-            "cycle_weight":      float(cfg.cycle_weight),
             "epsilon_scale":     float(cfg.epsilon_scale),
         })
 
@@ -519,27 +490,22 @@ def save_result(
           + (f"  (+{len(color_names)} colour features)" if color_names else ""), flush=True)
 
 
-def default_color_features(X: torch.Tensor, F: torch.Tensor) -> dict[str, np.ndarray]:
-    """Per-wingbeat physical scalars to colour the embedding by (diagnostics only).
+def default_color_features(F: torch.Tensor) -> dict[str, np.ndarray]:
+    """Per-wingbeat body-response scalars to colour the embedding by (diagnostics only).
 
     None of these enter the embedding — they are post-hoc overlays. From the body
     labels F: one channel per angular-acceleration component (named yaw/pitch/roll
     when C==3, generic otherwise); these let you check whether the wing-only
-    embedding organises by body response. From the kinematics X: the peak-to-peak
-    amplitude of each wing-angle channel (stroke φ, deviation θ, rotation ψ when
-    C==3). All returned as (N,) numpy arrays aligned to the rows.
+    embedding organises by body response. Wing-angle quantities are deliberately
+    excluded — they are derived from the same wing samples that build the embedding,
+    so colouring by them would be circular. All returned as (N,) numpy arrays
+    aligned to the rows.
     """
     feats: dict[str, np.ndarray] = {}
     C = F.shape[1]
     label_names = ["yaw_accel", "pitch_accel", "roll_accel"] if C == 3 else [f"F{i}_accel" for i in range(C)]
     for i, name in enumerate(label_names):
         feats[name] = F[:, i].detach().cpu().numpy()
-
-    amp_names = ["phi_amplitude", "theta_amplitude", "psi_amplitude"] if X.shape[1] == 3 \
-        else [f"ch{i}_amplitude" for i in range(X.shape[1])]
-    amplitude = (X.amax(dim=2) - X.amin(dim=2))                 # (N, C): peak-to-peak per channel
-    for i, name in enumerate(amp_names):
-        feats[name] = amplitude[:, i].detach().cpu().numpy()
     return feats
 
 
@@ -552,7 +518,9 @@ def load_single_wing_dataset(path: str, device: str) -> tuple[torch.Tensor, dict
     Returns (X, color_features). The colour features are post-hoc diagnostics that
     never enter the metric: the per-wingbeat (yaw, pitch, roll) maneuver scores in
     [0,1] (body-response proxies, to ask "does the wing-only embedding organise by
-    body response?") plus the peak-to-peak amplitude of each wing angle.
+    body response?"). Wing-angle quantities are deliberately NOT included — they are
+    derived from the same wing samples that build the embedding, so colouring by them
+    would be circular.
     """
     z = np.load(path, allow_pickle=True)
     X = torch.from_numpy(np.asarray(z["single_wing_wingbeats"], dtype=np.float32)).to(device)
@@ -562,9 +530,6 @@ def load_single_wing_dataset(path: str, device: str) -> tuple[torch.Tensor, dict
         "pitch_maneuver": scores[:, 1],
         "roll_maneuver":  scores[:, 2],
     }
-    amp = (X.amax(dim=2) - X.amin(dim=2)).detach().cpu().numpy()       # (N, 3): peak-to-peak
-    for i, nm in enumerate(["phi_amplitude", "theta_amplitude", "psi_amplitude"]):
-        feats[nm] = amp[:, i]
     return X, feats
 
 
@@ -626,7 +591,7 @@ def main() -> None:
         # colour-only diagnostic path so a dummy run mirrors the real one.
         X = torch.randn(args.n, args.channels, args.timesteps, device=device)
         F = torch.randn(args.n, args.channels, device=device)
-        color_features = default_color_features(X, F)
+        color_features = default_color_features(F)
         print(f"[ddm] dummy data: X={tuple(X.shape)} (colour features: randn)", flush=True)
     else:
         X, color_features = load_single_wing_dataset(args.data, device)
@@ -638,7 +603,7 @@ def main() -> None:
     print()
     print("=== Wing-only Diffusion Map result ===")
     print(f"  samples            : {result.extra['n']}")
-    print(f"  augmented features : {result.extra['n_features']}")
+    print(f"  features           : {result.extra['n_features']}")
     print(f"  epsilon            : {result.epsilon:.6g}")
     print(f"  eig backend        : {result.backend_eig}")
     print(f"  trivial eigenvalue : {result.trivial_eigenvalue:.6f}  (expect ~1.0)")
