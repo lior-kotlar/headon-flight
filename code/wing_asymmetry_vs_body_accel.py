@@ -21,9 +21,10 @@ The PCA basis and the encode are reused verbatim from inspect_latent_space, so
 "PC3" here is the exact component drawn in that tool's angle_space HTMLs.
 
 The x-axis quantity is a selectable body-kinematics proxy (--target): the current
-beat's angular accel (default), the NEXT beat's accel, the mean of this+next, or the
-across-beat change in angular velocity ω_next−ω_this. Columns are the body axes
-(--axes; default yaw/pitch/roll).
+beat's angular accel (default), the across-beat change in angular velocity ω_next−ω_this,
+or the within-beat change ω_last−ω_first (the angular velocity at the wingbeat's last
+interpolated sample minus its first, read off the same n-samples-per-wingbeat grid the
+wings are resampled to). Columns are the body axes (--axes; default yaw/pitch/roll).
 
 Run from the project root:
 
@@ -31,7 +32,7 @@ Run from the project root:
         --model_dir data/models/autoencoder_single_wing/ae_sw_latsweep_20260617_174025/latent_dim_4
     # several directions / proxies / a subset of axes at once (one figure per combo):
     python code/wing_asymmetry_vs_body_accel.py --model_dir <dir> \
-        --component pc:0 pc:1 --target accel accel_next dvel_next --axes pitch roll
+        --component pc:0 pc:1 --target accel dvel_next dvel_within --axes pitch roll
 """
 
 import argparse
@@ -55,10 +56,12 @@ from inspect_latent_space import _load_inputs, _compute_pca
 # body_means layout is [v(3), a(3), ω(3), α(3)], each triple ordered (yaw, pitch, roll).
 # So angular VELOCITY ω is cols 6-8 and angular ACCELERATION α is cols 9-11 (the latter
 # matching inspect_latent_space / transform_data._BODY_ALPHA_COLS).
+# `vidx` is the axis index (0=yaw, 1=pitch, 2=roll) into the per-wingbeat
+# body_omega_endpoints array (N, 3, 2), used by the within-beat Δω proxy.
 _AXIS_COLS = {
-    "yaw":   {"omega": 6, "alpha":  9},
-    "pitch": {"omega": 7, "alpha": 10},
-    "roll":  {"omega": 8, "alpha": 11},
+    "yaw":   {"omega": 6, "alpha":  9, "vidx": 0},
+    "pitch": {"omega": 7, "alpha": 10, "vidx": 1},
+    "roll":  {"omega": 8, "alpha": 11, "vidx": 2},
 }
 _ALL_AXES = ["yaw", "pitch", "roll"]
 
@@ -104,12 +107,15 @@ def _direction_vector(kind: str, idx: int, pca: dict, latent_dim: int) -> tuple[
 # Each builder maps the per-wingbeat body kinematics to ONE scalar per wingbeat for a
 # given axis, plus a validity mask (False where the proxy is undefined — e.g. the last
 # wingbeat of a trajectory has no "next"). `nxt[i]` is the row of the next wingbeat in
-# the same trajectory, or -1 if none. `cols` is _AXIS_COLS[axis] (its ω and α columns).
+# the same trajectory, or -1 if none. `cols` is _AXIS_COLS[axis] (its ω/α columns and the
+# `vidx` axis index into the endpoint array). `omega_ep` is the per-wingbeat (N, 3, 2)
+# body_omega_endpoints array ([..., 0]=first interp sample, [..., 1]=last), or None when the
+# npz predates it; only the within-beat proxy uses it.
 #
 # All proxies inherit the dataset's L/R-mirror symmetry: the augmentation mirrors whole
-# trajectories, so next-beat yaw/roll flip sign and pitch is kept, exactly like this-beat
-# values. Hence the structural zeros (diff·pitch, sum·yaw, sum·roll ≡ 0) hold for every
-# proxy — a built-in correctness check on the next-beat indexing.
+# trajectories, so yaw/roll flip sign and pitch is kept for this-beat, next-beat AND
+# within-beat endpoint quantities alike. Hence the structural zeros (diff·pitch, sum·yaw,
+# sum·roll ≡ 0) hold for every proxy — a built-in correctness check on the indexing.
 
 
 def _next_index(traj_ids_N: np.ndarray) -> np.ndarray:
@@ -124,31 +130,15 @@ def _next_index(traj_ids_N: np.ndarray) -> np.ndarray:
     return nxt
 
 
-def _target_accel(bm, nxt, cols):
+def _target_accel(bm, nxt, cols, omega_ep):
     """Angular acceleration of THIS wingbeat (the original proxy)."""
     return bm[:, cols["alpha"]].astype(np.float64), np.ones(bm.shape[0], dtype=bool)
 
 
-def _target_accel_next(bm, nxt, cols):
-    """Angular acceleration of the NEXT wingbeat — does the current wing state lead it?"""
-    valid = nxt >= 0
-    y = np.full(bm.shape[0], np.nan)
-    y[valid] = bm[nxt[valid], cols["alpha"]]
-    return y, valid
-
-
-def _target_accel_mean(bm, nxt, cols):
-    """Mean angular acceleration of THIS and the next wingbeat."""
-    valid = nxt >= 0
-    a = bm[:, cols["alpha"]].astype(np.float64)
-    y = np.full(bm.shape[0], np.nan)
-    y[valid] = 0.5 * (a[valid] + a[nxt[valid]])
-    return y, valid
-
-
-def _target_dvel_next(bm, nxt, cols):
+def _target_dvel_next(bm, nxt, cols, omega_ep):
     """Change in angular VELOCITY across to the next wingbeat: ω_next − ω_this — a
-    finite-difference 'how much rotation did this beat actually impart to the body'."""
+    finite-difference 'how much rotation did this beat actually impart to the body',
+    using each beat's MEAN ω."""
     valid = nxt >= 0
     w = bm[:, cols["omega"]].astype(np.float64)
     y = np.full(bm.shape[0], np.nan)
@@ -156,12 +146,21 @@ def _target_dvel_next(bm, nxt, cols):
     return y, valid
 
 
+def _target_dvel_within(bm, nxt, cols, omega_ep):
+    """Within-beat change in angular VELOCITY: ω at the wingbeat's LAST interpolated sample
+    minus its FIRST (ω_last − ω_first). Unlike dvel_next this uses the sampled ω at the beat's
+    two ends — read off body_omega_endpoints, the interpolated n-samples-per-wingbeat grid —
+    not the per-beat mean. The caller guarantees omega_ep is present for this target."""
+    j = cols["vidx"]
+    y = omega_ep[:, j, 1] - omega_ep[:, j, 0]              # last − first
+    return y.astype(np.float64), np.ones(bm.shape[0], dtype=bool)
+
+
 # name → (human label for plot/JSON, builder). Pick with --target (multi-valued).
 _TARGETS = {
-    "accel":      ("α (this beat)",         _target_accel),
-    "accel_next": ("α (next beat)",         _target_accel_next),
-    "accel_mean": ("mean α (this+next)",    _target_accel_mean),
-    "dvel_next":  ("Δω (ω_next − ω_this)",  _target_dvel_next),
+    "accel":       ("α (this beat)",                    _target_accel),
+    "dvel_next":   ("Δω (ω_next − ω_this)",             _target_dvel_next),
+    "dvel_within": ("Δω within beat (ω_last − ω_first)", _target_dvel_within),
 }
 
 
@@ -221,7 +220,8 @@ def _draw_panel(ax, x, y, st, *, axis_name, combo_label, clip_pct):
 
 def _analyze_component(
     spec: str, ctx: dict, pca: dict, body_means_N: np.ndarray, nxt: np.ndarray,
-    target_key: str, axes: list[str], out_dir: str, lat_prefix: str, clip_pct: float,
+    omega_ep_N: np.ndarray | None, target_key: str, axes: list[str], out_dir: str,
+    lat_prefix: str, clip_pct: float,
 ) -> None:
     kind, idx = _parse_component(spec)
     latent_dim = ctx["latent_dim"]
@@ -254,7 +254,7 @@ def _analyze_component(
     for row, combo_label in enumerate(_COMBOS):
         y_proj = combos[combo_label]
         for col, axis_name in enumerate(axes):
-            tgt, valid = target_fn(body_means_N, nxt, _AXIS_COLS[axis_name])
+            tgt, valid = target_fn(body_means_N, nxt, _AXIS_COLS[axis_name], omega_ep_N)
             m = valid & np.isfinite(tgt) & np.isfinite(y_proj)
             x, y = tgt[m], y_proj[m]
             st = _panel_stats(x, y)
@@ -328,13 +328,16 @@ def main() -> None:
     )
     parser.add_argument("--model_dir", required=True,
                         help="Single-wing model dir holding best_autoencoder.pt and best_config.json.")
-    parser.add_argument("--component", nargs="+", default=["pc:3"],
-                        help="Latent direction(s) to project on: 'pc:K' (PCA component, default pc:3) "
-                             "or 'dim:K' (raw latent dim). Pass several for one figure each.")
-    parser.add_argument("--target", nargs="+", default=["accel"], choices=list(_TARGETS),
+    parser.add_argument("--component", nargs="+", default=["all"],
+                        help="Latent direction(s) to project on: 'pc:K' (PCA component), "
+                             "'dim:K' (raw latent dim), or 'all' for every PCA component "
+                             "(resolved once the model's latent_dim is known). One figure per "
+                             "direction (default: all PCs).")
+    parser.add_argument("--target", nargs="+", default=list(_TARGETS), choices=list(_TARGETS),
                         help="Body-kinematics proxy on the x-axis: accel=this beat's α; "
-                             "accel_next=next beat's α; accel_mean=mean(this,next) α; "
-                             "dvel_next=ω_next−ω_this. Pass several for one figure each (default accel).")
+                             "dvel_next=ω_next−ω_this (mean-ω across beats); "
+                             "dvel_within=ω_last−ω_first (sampled ω at this beat's ends). "
+                             "One figure per proxy (default: all proxies).")
     parser.add_argument("--axes", nargs="+", default=_ALL_AXES, choices=_ALL_AXES,
                         help="Which body axes to plot as columns (default: all three). "
                              "E.g. --axes pitch roll to drop yaw.")
@@ -373,9 +376,27 @@ def main() -> None:
         )
     _assert_pairing(wing_side, body_means)
 
+    # body_omega_endpoints (2N, 3, 2) is the within-beat proxy's input; older datasets (schema
+    # < 4) lack it. Load + alignment-check here so the dvel_within target can read per-wingbeat ω
+    # ends, and fail early with a rebuild hint if it's requested but missing.
+    omega_ep_2N = d["body_omega_endpoints"] if "body_omega_endpoints" in d.files else None
+    if omega_ep_2N is not None and omega_ep_2N.shape[0] != ctx["z_all"].shape[0]:
+        raise SystemExit(
+            f"body_omega_endpoints rows ({omega_ep_2N.shape[0]}) ≠ encoded wingbeats "
+            f"({ctx['z_all'].shape[0]}) — refusing to plot a misaligned correlation."
+        )
+    if "dvel_within" in args.target and omega_ep_2N is None:
+        raise SystemExit(
+            f"target 'dvel_within' needs the 'body_omega_endpoints' array, absent from "
+            f"{ctx['npz_path']} (single-wing dataset schema < 4). Rebuild it with:\n"
+            f"    python code/transform_data.py --single_wing_fixed_len <L>\n"
+            f"(or retrain so the autoencoder auto-build refreshes the dataset)."
+        )
+
     # Collapse to one row per physical wingbeat (the L/R rows are duplicates), then index
     # each wingbeat's next beat within the same trajectory for the next-beat proxies.
     body_means_N   = body_means[0::2]                       # (N, 12)
+    omega_ep_N     = omega_ep_2N[0::2] if omega_ep_2N is not None else None  # (N, 3, 2)
     trajectory_ids = np.asarray(d["trajectory_ids"][0::2])  # (N,)
     nxt            = _next_index(trajectory_ids)
 
@@ -383,10 +404,16 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     pca = _compute_pca(ctx["z_all"], ctx["z_mean"])
+
+    # Resolve the 'all' sentinel now that latent_dim (= number of PCA components) is known.
+    components = args.component
+    if any(c.strip().lower() == "all" for c in components):
+        components = [f"pc:{k}" for k in range(pca["components"].shape[0])]
+
     for target_key in args.target:
-        for spec in args.component:
-            _analyze_component(spec, ctx, pca, body_means_N, nxt, target_key, args.axes,
-                               out_dir, ctx["lat_prefix"], args.clip_pct)
+        for spec in components:
+            _analyze_component(spec, ctx, pca, body_means_N, nxt, omega_ep_N, target_key,
+                               args.axes, out_dir, ctx["lat_prefix"], args.clip_pct)
 
     print(f"\nDone. Outputs in: {out_dir}", flush=True)
 

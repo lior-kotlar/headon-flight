@@ -510,18 +510,23 @@ def _load_wing_and_body_trajectories(
 
 
 _FIXED_LEN_INTERP_METHOD = "cubic_spline"   # what we use to resample SA wingbeats to L
-_FIXED_LEN_SCHEMA_VERSION = 3                # bump when on-disk schema changes
+_FIXED_LEN_SCHEMA_VERSION = 4                # bump when on-disk schema changes
                                               # v2: added body_means + maneuver_scores arrays
                                               #     and matching sidecar fields
                                               # v3: maneuver_scores narrowed from 6 channels
                                               #     to 3 (angular acceleration only; linear
                                               #     acceleration excluded until gravity is
                                               #     subtracted upstream)
+                                              # v4: single-wing dataset adds
+                                              #     body_omega_endpoints (2N, 3, 2): ω at the
+                                              #     first and last interpolated sample of each
+                                              #     wingbeat (for within-beat Δω proxies)
 
 # Body kinematics column layout from _extract_features_and_targets:
 # [v(3), a(3), ω(3), α(3)]. _BODY_A_COLS is kept here as documentation; linear
 # acceleration is not currently fed into maneuver scoring.
 _BODY_A_COLS     = slice(3, 6)    # linear acceleration in body frame (unused, contains gravity)
+_BODY_OMEGA_COLS = slice(6, 9)    # angular velocity in body frame (yaw, pitch, roll)
 _BODY_ALPHA_COLS = slice(9, 12)   # angular acceleration in body frame
 
 
@@ -751,6 +756,12 @@ def build_single_wing_fixed_len_dataset(
     body_means and maneuver_scores are computed once per wingbeat (the body state
     is shared by both wings) and duplicated across the left/right rows so every
     array is aligned at the 2N sample level. Atomic write, same as the 6-ch builder.
+
+    Also stores body_omega_endpoints (2N, 3, 2): the body-frame angular velocity ω
+    (yaw, pitch, roll) at the first and last sample of each wingbeat *after* the same
+    CubicSpline resampling to L applied to the wing angles — i.e. read off the
+    interpolated n-samples-per-wingbeat grid, not the raw native samples. Lets a
+    consumer form the within-beat change Δω = ω_last − ω_first per axis.
     """
     if len(body_trajectories) != len(trajectories):
         raise ValueError(
@@ -760,6 +771,7 @@ def build_single_wing_fixed_len_dataset(
     wing_samples:    list[np.ndarray] = []   # (3, L) per single wing
     wing_side:       list[int]        = []   # 0 = left, 1 = right
     body_means_wb:   list[np.ndarray] = []   # (12,) per wingbeat (N-level)
+    omega_ep_wb:     list[np.ndarray] = []   # (3, 2) per wingbeat: ω at [first, last] interp sample
     durations_wb:    list[int]        = []   # N-level
     trajectory_wb:   list[int]        = []   # N-level
     n_skipped = 0
@@ -784,6 +796,11 @@ def build_single_wing_fixed_len_dataset(
                 wing_samples.append(res_L_norm.T.astype(np.float32))                # (3, L)
                 wing_side.append(side)
             body_means_wb.append(body[start:end].mean(axis=0).astype(np.float32))
+            # Angular velocity ω resampled to L exactly like the wing angles, so its first/last
+            # sample come from the same interpolated n-samples-per-wingbeat grid (not the raw
+            # native samples). CubicSpline preserves endpoints, so these equal the segment ends.
+            omega_L = _cubic_resample(body[start:end, _BODY_OMEGA_COLS], L)          # (L, 3)
+            omega_ep_wb.append(np.stack([omega_L[0], omega_L[-1]], axis=1).astype(np.float32))  # (3, 2)
             durations_wb.append(n)
             trajectory_wb.append(traj_id)
 
@@ -798,7 +815,10 @@ def build_single_wing_fixed_len_dataset(
     dur_wb   = np.asarray(durations_wb,  dtype=np.int32)               # (N,)
     tid_wb   = np.asarray(trajectory_wb, dtype=np.int32)               # (N,)
 
+    oep_wb   = np.stack(omega_ep_wb)                                     # (N, 3, 2)
+
     bm_arr   = np.repeat(bm_wb,  2, axis=0)                              # (2N, 12)
+    oep_arr  = np.repeat(oep_wb, 2, axis=0)                              # (2N, 3, 2)
     dur_arr  = np.repeat(dur_wb, 2, axis=0)                              # (2N,)
     tid_arr  = np.repeat(tid_wb, 2, axis=0)                              # (2N,)
 
@@ -846,6 +866,7 @@ def build_single_wing_fixed_len_dataset(
         single_wing_wingbeats = sw_arr,
         wing_side             = side_arr,
         body_means            = bm_arr,
+        body_omega_endpoints  = oep_arr,
         maneuver_scores       = maneuver_scores,
         durations             = dur_arr,
         trajectory_ids        = tid_arr,
