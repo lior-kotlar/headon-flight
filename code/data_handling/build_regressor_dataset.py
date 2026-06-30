@@ -2,8 +2,10 @@
 Builds the training dataset for the body-kinematics → wingbeat-latent regressor.
 
 For every wingbeat in every (filtered) trajectory, records:
-  - body_mean:       (12,)  mean body-kinematics vector over the CURRENT wingbeat
-  - next_body_mean:  (12,)  mean body-kinematics vector over the NEXT wingbeat
+  - body_mean:       (15,)  CURRENT wingbeat: 12-d mean body-kinematics [v, a, ω, α]
+                            plus the within-beat Δω proxy (ω_last − ω_first, per axis)
+                            as channels 12–14 (see data_handling/body_features.py)
+  - next_body_mean:  (15,)  same 15-d feature vector over the NEXT wingbeat
   - target_latent:   (D,)   the trained encoder's output for the current wingbeat
   - sa_wingbeat:     (6, L) the exact normalized SA fed to the encoder (ground
                             truth for decode(latent) RMSE; avoids re-deriving the
@@ -44,12 +46,14 @@ from transform_data import (
     _segment_to_sa,
     _segment_to_single_wing,
     _cubic_resample,
+    _BODY_OMEGA_COLS,
     SA_PHYSICAL_SCALE,
     SINGLE_WING_PHYSICAL_SCALE,
     single_wing_template_path,
     trajectory_asymmetry_score,
 )
 from process_data import PROCESSED_DATA_DIR, _extract_features_and_targets, gather_condensed_h5
+from body_features import N_BODY_CHANNELS
 
 
 def _resolve_model_dir(model_dir: str) -> str:
@@ -147,6 +151,22 @@ def _load_filtered_trajectories(
     return body_list, wing_list
 
 
+def _body_feature_vector(segment: np.ndarray) -> np.ndarray:
+    """Per-wingbeat body feature vector consumed by the regressor: the 12-d mean
+    kinematics [v, a, ω, α] over the wingbeat, with the within-beat angular-velocity
+    change Δω = ω(last sample) − ω(first sample) appended as 3 channels (yaw, pitch, roll).
+
+    Δω is a finite-difference proxy for the mean angular acceleration over the beat
+    (see body_features._DWITHIN_CHANNEL_NAMES). Read off the segment's raw endpoints:
+    CubicSpline preserves endpoints, so these equal the resampled-grid ends used by
+    transform_data's body_omega_endpoints / wing_asymmetry_vs_body_accel 'dvel_within'.
+    `segment` is (n, 12); returns (N_BODY_CHANNELS,) float32.
+    """
+    mean12  = segment.mean(axis=0)                                       # (12,)
+    dwithin = segment[-1, _BODY_OMEGA_COLS] - segment[0, _BODY_OMEGA_COLS]  # (3,) ω_last − ω_first
+    return np.concatenate([mean12, dwithin]).astype(np.float32)         # (15,)
+
+
 def regressor_dataset_path(data_dir: str, latent_dim: int, L: int, representation: str = "sa") -> str:
     """Canonical dataset path, keyed on the (latent_dim, L) of the source autoencoder.
     The single-wing variant is tagged so it never collides with the 6-ch dataset.
@@ -184,6 +204,11 @@ def regressor_dataset_is_valid(
         return False, f"corrupt sidecar: {e}"
     if meta.get("representation", "sa") != representation:
         return False, f"representation mismatch ({meta.get('representation', 'sa')} ≠ {representation})"
+    # Datasets built before the within-beat Δω proxy stored only the 12 core channels; a
+    # mismatch here forces a rebuild so body_means carries the full feature vector.
+    if int(meta.get("n_body_channels", 12)) != int(N_BODY_CHANNELS):
+        return False, (f"n_body_channels mismatch ({meta.get('n_body_channels', 12)} ≠ "
+                       f"{N_BODY_CHANNELS}) — body feature vector changed; rebuild")
     if int(meta.get("latent_dim", -1)) != int(latent_dim):
         return False, f"latent_dim mismatch ({meta.get('latent_dim')} ≠ {latent_dim})"
     if int(meta.get("L", -1)) != int(L):
@@ -282,8 +307,9 @@ def build_regressor_dataset(
                 next_body_segment = body[end:next_end]                            # (m, 12)
                 wing_segment      = wing[start:end]                               # (n, 6)
 
-                body_mean      = body_segment.mean(axis=0).astype(np.float32)     # (12,)
-                next_body_mean = next_body_segment.mean(axis=0).astype(np.float32)  # (12,)
+                # (15,) each: 12-d mean kinematics + within-beat Δω proxy (ω_last − ω_first).
+                body_mean      = _body_feature_vector(body_segment)
+                next_body_mean = _body_feature_vector(next_body_segment)
 
                 if representation == "single_wing":
                     # Encode left (cols 0:3) and right (cols 3:6) wings independently
@@ -321,8 +347,8 @@ def build_regressor_dataset(
     if n_dropped_last:
         print(f"Note: dropped {n_dropped_last} trajectory-final wingbeats (no next wingbeat).")
 
-    body_means      = np.stack(body_means_list)                         # (N, 12) float32
-    next_body_means = np.stack(next_body_means_list)                    # (N, 12) float32
+    body_means      = np.stack(body_means_list)                         # (N, 15) float32 [12 kin + 3 Δω]
+    next_body_means = np.stack(next_body_means_list)                    # (N, 15) float32 [12 kin + 3 Δω]
     durations       = np.asarray(durations_list, dtype=np.int32)        # (N,)
     trajectory_ids  = np.asarray(trajectory_ids_list, dtype=np.int32)   # (N,)
 
@@ -339,6 +365,7 @@ def build_regressor_dataset(
     meta = {
         "representation":        representation,
         "n_wingbeats":           int(len(body_means)),
+        "n_body_channels":       int(body_means.shape[1]),  # 12 kinematics + 3 within-beat Δω
         "n_trajectories":        int(n_traj),
         "n_dropped_last":        int(n_dropped_last),
         "n_skipped":             int(n_skipped),

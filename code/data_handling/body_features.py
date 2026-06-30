@@ -19,24 +19,44 @@ from __future__ import annotations
 
 import numpy as np
 
-# Physical labels for the 12 body-mean channels. The angular blocks use
+# Physical labels for the 12 core body-mean channels. The angular blocks use
 # yaw/pitch/roll rather than x/y/z so feature sets read physically.
-BODY_CHANNEL_NAMES = [
+_CORE_BODY_CHANNEL_NAMES = [
     "v_x", "v_y", "v_z",
     "a_x", "a_y", "a_z",
     "w_yaw", "w_pitch", "w_roll",
     "alpha_yaw", "alpha_pitch", "alpha_roll",
 ]
-N_BODY_CHANNELS = len(BODY_CHANNEL_NAMES)  # 12
+N_CORE_BODY_CHANNELS = len(_CORE_BODY_CHANNEL_NAMES)  # 12
 
-# Named feature sets → indices into the 12-d body vector. "full" reproduces the
-# original 24-d (current+next) regressor input.
+# Within-beat angular-velocity change appended by build_regressor_dataset.py as 3 extra
+# channels (12, 13, 14): Δω = ω(wingbeat's last sample) − ω(first sample), per axis
+# (yaw, pitch, roll). This is a finite-difference proxy for the mean angular acceleration
+# α over the beat, carried in the SAME selectable feature vector so a regressor can use it
+# *instead of* (or alongside) the dataset's α channels. Same definition as the
+# `dvel_within` proxy in wing_asymmetry_vs_body_accel.py.
+_DWITHIN_CHANNEL_NAMES = ["dwithin_yaw", "dwithin_pitch", "dwithin_roll"]
+
+# Full per-wingbeat body feature vector = 12 core kinematics + 3 within-beat Δω channels.
+BODY_CHANNEL_NAMES = _CORE_BODY_CHANNEL_NAMES + _DWITHIN_CHANNEL_NAMES
+N_BODY_CHANNELS = len(BODY_CHANNEL_NAMES)  # 15
+
+# Named feature sets → indices into the body vector. "full" reproduces the original
+# 24-d (current+next) regressor input (the 12 core kinematics, no Δω proxy). The
+# *_dwithin sets swap in / add the within-beat Δω proxy so each has a direct α-based
+# counterpart to compare against (e.g. angular_accel ↔ dwithin, pitch_accel ↔ pitch_dwithin).
 FEATURE_SETS: dict[str, list[int]] = {
-    "full":          list(range(N_BODY_CHANNELS)),
+    "full":          list(range(N_CORE_BODY_CHANNELS)),
     "pitch":         [7, 10],          # w_pitch, alpha_pitch
     "pitch_accel":   [10],             # alpha_pitch only
     "angular_accel": [9, 10, 11],      # yaw/pitch/roll angular acceleration
     "angular":       [6, 7, 8, 9, 10, 11],  # angular velocity + acceleration
+    # --- within-beat Δω proxies for angular acceleration (channels 12–14) ---
+    "dwithin":             [12, 13, 14],            # Δω all axes        (↔ angular_accel)
+    "pitch_dwithin":       [13],                    # Δω pitch only      (↔ pitch_accel)
+    "pitch_vel_dwithin":   [7, 13],                 # w_pitch + Δω_pitch (↔ pitch)
+    "angular_vel_dwithin": [6, 7, 8, 12, 13, 14],   # angular velocity + Δω (↔ angular)
+    "full_dwithin":        [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 13, 14] # full but use dwithin instead of α
 }
 
 DEFAULT_FEATURE_SET = "full"
@@ -73,9 +93,9 @@ def resolve_feature_set(
 
 def default_scaler_type(indices: list[int]) -> str:
     """The scaler used when the config doesn't specify one: ``vector_norm`` for the
-    full 12-channel set (3-vector groups, original behavior), else ``standardize``
-    (per-channel z-score, which works for any subset)."""
-    return "vector_norm" if list(indices) == list(range(N_BODY_CHANNELS)) else "standardize"
+    full 12-channel core set (3-vector groups, original behavior), else ``standardize``
+    (per-channel z-score, which works for any subset including the Δω proxy channels)."""
+    return "vector_norm" if list(indices) == list(range(N_CORE_BODY_CHANNELS)) else "standardize"
 
 
 def scaler_to_offset_scale(scaler: dict) -> tuple[list[int], np.ndarray, np.ndarray]:

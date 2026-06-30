@@ -39,11 +39,13 @@ from transform_data import (
 class BodyToWingbeat(nn.Module):
     """Wraps a trained regressor + frozen decoder; composes a full wingbeat from body kinematics.
 
-    The regressor consumes a configurable subset of the 12-d body-mean vector
+    The regressor consumes a configurable subset of the body feature vector
     (body_feature_indices), selected identically from the CURRENT and NEXT
-    wingbeat's mean body kinematics and scaled per-channel ((x - offset) / scale).
-    Callers always pass the full 12-d body means; the selection happens here, so
-    the same call site serves any feature set ("full" → 24-d, "pitch" → 4-d, ...).
+    wingbeat's body kinematics and scaled per-channel ((x - offset) / scale).
+    The vector is the 12 core mean kinematics plus the 3 within-beat Δω proxy
+    channels (12–14; see data_handling/body_features.py). Callers always pass the
+    full body vector; the selection happens here, so the same call site serves any
+    feature set ("full" → 24-d, "pitch" → 4-d, "dwithin" → 6-d, ...).
 
     Two representations:
       * 'sa'          — regressor predicts one latent z; the frozen 6-ch decoder maps
@@ -89,8 +91,8 @@ class BodyToWingbeat(nn.Module):
         self.min_duration = int(min_duration)
 
     def scale_body(self, body_mean: torch.Tensor, next_body_mean: torch.Tensor) -> torch.Tensor:
-        """Both inputs: (B, 12). Selects body_indices from each half, scales them
-        ((x - offset) / scale), and concatenates → (B, 2 * len(indices))."""
+        """Both inputs: (B, n_body_channels). Selects body_indices from each half, scales
+        them ((x - offset) / scale), and concatenates → (B, 2 * len(indices))."""
         scaled_curr = (body_mean.index_select(-1, self.body_indices)      - self.body_offset) / self.body_scale
         scaled_next = (next_body_mean.index_select(-1, self.body_indices) - self.body_offset) / self.body_scale
         return torch.cat([scaled_curr, scaled_next], dim=-1)
@@ -103,7 +105,7 @@ class BodyToWingbeat(nn.Module):
         """Raw body kinematics → (latent, duration (B,) int).
 
         latent is (B, D) for 'sa' and (B, 2, D) for 'single_wing'.
-        body_mean, next_body_mean: (B, 12) each.
+        body_mean, next_body_mean: (B, n_body_channels) each (full body feature vector).
         """
         x = self.scale_body(body_mean, next_body_mean)
         pred_l, pred_d_std = self.regressor(x)

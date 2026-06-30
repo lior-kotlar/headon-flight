@@ -39,6 +39,7 @@ from data_handling.body_features import (
     resolve_feature_set,
     default_scaler_type,
     apply_body_scaler_np,
+    BODY_CHANNEL_NAMES,
 )
 
 
@@ -240,12 +241,8 @@ def _print_diagnostics(splits: dict, dataset_path: str, ae_model_dir: str) -> No
     print(f"Trajectories: {n_tr_trajs} train / {n_vl_trajs} val")
     print()
 
-    body_channel_names = [
-        "v_x", "v_y", "v_z",
-        "a_x", "a_y", "a_z",
-        "w_x", "w_y", "w_z",
-        "alpha_x", "alpha_y", "alpha_z",
-    ]
+    # Full body feature vector layout (12 core kinematics + 3 within-beat Δω channels).
+    body_channel_names = list(BODY_CHANNEL_NAMES)
     print("Feature distribution comparison  (|Δμ|/σ_train > ~1 = noteworthy shift):")
     print(f"  {'channel':24s}  {'tr_mean':>10s}  {'tr_std':>10s}  {'va_mean':>10s}  {'va_std':>10s}  {'|Δμ|/σ':>7s}")
 
@@ -269,12 +266,13 @@ def _print_diagnostics(splits: dict, dataset_path: str, ae_model_dir: str) -> No
     _row("log_duration",       log_dur[tr], log_dur[vl])
 
     # --- VectorNormScaler scale factors (computed on train, applied to both halves) ---
-    scale_12 = _fit_vector_norm_scale(body[tr])
-    vector_names = ["v", "a", "ω", "α"]
+    # One scale per consecutive 3-vector group of the body vector: v, a, ω, α, then Δω.
+    scale_vec = _fit_vector_norm_scale(body[tr])
+    vector_names = ["v", "a", "ω", "α", "Δω"][: scale_vec.shape[0] // 3]
     print()
     print("VectorNormScaler scale factors (mean L2 magnitude per physical 3-vector, train set):")
     for i, vname in enumerate(vector_names):
-        print(f"  ‖{vname}‖_mean = {scale_12[3 * i]:.4f}")
+        print(f"  ‖{vname}‖_mean = {scale_vec[3 * i]:.4f}")
 
     # --- Baselines on val ---
     # The trained model needs to beat these. If it can't, the problem isn't the model.
