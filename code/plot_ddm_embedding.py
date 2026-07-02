@@ -170,13 +170,16 @@ def plot_3d_dcs_plotly(
     save_path: str,
     colored: bool = False,
     max_points: int = 20000,
+    default_feature: str | None = None,
 ) -> None:
     """Interactive 3-D scatter of the leading three diffusion coordinates (DC1, DC2,
     DC3), one point per wingbeat, written as a standalone Plotly HTML.
 
     colored=False (default): a single monochrome cloud — just the manifold shape.
     colored=True: points coloured by physical quantity, with a dropdown to switch
-    which colour feature (body yaw/pitch/roll accel) drives the colour scale.
+    which colour feature (body yaw/pitch/roll accel, phi_amplitude, ...) drives the
+    colour scale. default_feature names which one is shown on load (and is the active
+    dropdown entry); if unset or not present, the first feature is used.
     """
     import plotly.graph_objects as go
 
@@ -196,14 +199,16 @@ def plot_3d_dcs_plotly(
             marker=dict(size=2, color="#1f77b4", opacity=0.6), hoverinfo="skip",
         ))
     else:
-        # One trace per colour feature; a dropdown toggles which one is visible.
+        # One trace per colour feature; a dropdown toggles which one is visible. The
+        # trace shown on load is default_feature (else the first feature).
         names = list(features)
+        default_idx = names.index(default_feature) if default_feature in names else 0
         traces = []
         for i, name in enumerate(names):
             c = features[name][sel]
             lo, hi = np.percentile(c, [2, 98])
             traces.append(go.Scatter3d(
-                x=x, y=y, z=z, mode="markers", name=name, visible=(i == 0),
+                x=x, y=y, z=z, mode="markers", name=name, visible=(i == default_idx),
                 marker=dict(size=2, color=c, cmin=lo, cmax=hi, colorscale="Spectral_r",
                             opacity=0.6, colorbar=dict(title=name)),
                 hoverinfo="skip",
@@ -215,7 +220,7 @@ def plot_3d_dcs_plotly(
         ]
         fig = go.Figure(traces)
         layout_kwargs["updatemenus"] = [dict(
-            buttons=buttons, direction="down", showactive=True,
+            buttons=buttons, active=default_idx, direction="down", showactive=True,
             x=0.0, xanchor="left", y=1.08, yanchor="top",
         )]
 
@@ -290,8 +295,52 @@ def print_correlation_table(corr: np.ndarray, names: list[str]) -> None:
     print()
 
 
-def visualize(embedding_path: str, save_dir: str, colored: bool = False, max_points: int = 20000) -> None:
+def augment_with_phi_amplitude(
+    features: dict[str, np.ndarray],
+    coords: np.ndarray,
+    wingbeats_path: str,
+    template_path: str | None = None,
+) -> dict[str, np.ndarray]:
+    """Add a `phi_amplitude_deg` colour feature computed from the raw single-wing wingbeats.
+
+    This plotter only colours by features baked into the embedding at DDM-build time,
+    so an embedding whose run predates the stroke-amplitude overlay can't otherwise be
+    coloured by it. Rather than re-run the (expensive) eigendecomp, recompute the physical
+    stroke amplitude (peak-to-peak φ per wingbeat, in degrees — the stored φ is a
+    template residual / π, so the golden template is added back; see
+    directed_diffusion_map.wingbeat_phi_amplitude) straight from the source wingbeats. The
+    DDM pipeline never reorders or subsamples rows, so the wingbeats file is row-aligned to
+    the embedding as long as their lengths match — which is asserted (a mismatch means a
+    different dataset, so we refuse rather than silently mis-colour).
+    """
+    from directed_diffusion_map import (
+        wingbeat_phi_amplitude, load_single_wing_template, DEFAULT_SINGLE_WING_TEMPLATE,
+    )
+
+    z = np.load(wingbeats_path, allow_pickle=True)
+    wb = np.asarray(z["single_wing_wingbeats"], dtype=np.float32)      # (N, 3, T): φ, θ, ψ residual/scale
+    if wb.shape[0] != coords.shape[0]:
+        raise ValueError(
+            f"--wingbeats {wingbeats_path} has {wb.shape[0]} wingbeats but the embedding has "
+            f"{coords.shape[0]} points; they must be row-aligned (same dataset, no subsampling)."
+        )
+    template3 = load_single_wing_template(template_path or DEFAULT_SINGLE_WING_TEMPLATE)
+    features = dict(features)
+    features["phi_amplitude_deg"] = wingbeat_phi_amplitude(wb, template3)
+    units = "physical degrees" if template3 is not None else "unitless residual (template missing)"
+    print(f"  + phi_amplitude_deg colour feature recomputed from {wingbeats_path} [{units}]", flush=True)
+    return features
+
+
+def visualize(embedding_path: str, save_dir: str, colored: bool = False, max_points: int = 20000,
+              wingbeats_path: str | None = None, color_by: str | None = None,
+              template_path: str | None = None) -> None:
     coords, eigvals, features = load_embedding(embedding_path)
+    if wingbeats_path:
+        features = augment_with_phi_amplitude(features, coords, wingbeats_path, template_path)
+    if color_by and color_by not in features:
+        print(f"  (--color_by {color_by!r} not among colour features {list(features)}; "
+              f"falling back to the first)", flush=True)
     os.makedirs(save_dir, exist_ok=True)
     print(f"[viz] embedding: {coords.shape[0]} points × {coords.shape[1]} coords | "
           f"colour={'on' if colored else 'off'} | "
@@ -299,7 +348,7 @@ def visualize(embedding_path: str, save_dir: str, colored: bool = False, max_poi
 
     plot_scree(eigvals, os.path.join(save_dir, "scree.png"))
     plot_3d_dcs_plotly(coords, features, os.path.join(save_dir, "ddm_3d.html"),
-                       colored=colored, max_points=max_points)
+                       colored=colored, max_points=max_points, default_feature=color_by)
 
     if not colored:
         print("  (--color not set: skipping colour-by-quantity plots; pass --color to enable)", flush=True)
@@ -332,10 +381,26 @@ def main() -> None:
                    help="colour the plots by physical quantity (body yaw/pitch/roll accel) and emit the "
                         "colour-by-quantity views; default is uncoloured (plain manifold shape only)")
     p.set_defaults(colored=False)
+    p.add_argument("--wingbeats", default=None,
+                   help="optional single-wing .npz (with `single_wing_wingbeats`) to add a "
+                        "`phi_amplitude_deg` (physical stroke peak-to-peak, degrees) colour feature, "
+                        "recomputed from the raw wingbeats — colours an embedding built before this "
+                        "overlay existed without re-running the DDM (rows must be aligned; length is "
+                        "checked). Implies --color.")
+    p.add_argument("--template", default=None,
+                   help="single-wing golden template .npy (physical radians) used to reconstruct the "
+                        "physical stroke amplitude for phi_amplitude_deg (default: the standard "
+                        "data/analysis/golden_template_single_wing.npy).")
+    p.add_argument("--color_by", default=None,
+                   help="colour-feature name shown on load in the 3-D plot (still switchable via the "
+                        "dropdown); defaults to `phi_amplitude_deg` when --wingbeats is given, else the first.")
     args = p.parse_args()
 
     save_dir = args.save_dir or os.path.join(os.path.dirname(os.path.abspath(args.embedding)), "ddm_viz")
-    visualize(args.embedding, save_dir, colored=args.colored, max_points=args.max_points)
+    colored = args.colored or bool(args.wingbeats)
+    color_by = args.color_by or ("phi_amplitude_deg" if args.wingbeats else None)
+    visualize(args.embedding, save_dir, colored=colored, max_points=args.max_points,
+              wingbeats_path=args.wingbeats, color_by=color_by, template_path=args.template)
 
 
 if __name__ == "__main__":

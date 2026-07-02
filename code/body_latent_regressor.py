@@ -436,9 +436,13 @@ def train_one(
         config.get("feature_set"), config.get("body_feature_indices"),
     )
     scaler_type = config.get("body_scaler") or default_scaler_type(indices)
+    # Temporal window: True (default) feeds [current, next] wingbeat halves (2·k dims);
+    # False feeds only the current wingbeat (k dims). The scaler is fit on the current
+    # half either way, so both variants share the same per-channel scaling.
+    use_next = bool(config.get("use_next_wingbeat", True))
     body_scaler = _fit_body_scaler(body_means[train_idx], indices, scaler_type)
-    X_train = apply_body_scaler_np(body_means[train_idx], next_body_means[train_idx], body_scaler)
-    X_val   = apply_body_scaler_np(body_means[val_idx],   next_body_means[val_idx],   body_scaler)
+    X_train = apply_body_scaler_np(body_means[train_idx], next_body_means[train_idx], body_scaler, include_next=use_next)
+    X_val   = apply_body_scaler_np(body_means[val_idx],   next_body_means[val_idx],   body_scaler, include_next=use_next)
 
     # --- Duration is standardized in log-space (independent of body scaling) ---
     log_dur = np.log(durations.astype(np.float32))
@@ -452,6 +456,7 @@ def train_one(
 
     print(f"  Train: {len(X_train)} wingbeats | Val: {len(X_val)} wingbeats")
     print(f"  Feature set: {feat_names} (indices {indices}) | scaler: {scaler_type}")
+    print(f"  Temporal window: {'current+next' if use_next else 'current-only'} wingbeat(s)")
     print(f"  Input dim: {X_train.shape[1]}  |  Latent dim (from dataset): {inferred_latent_dim}"
           f"  |  n_wings: {n_wings}")
 
@@ -580,6 +585,7 @@ def train_one(
         "body_feature_indices": [int(i) for i in indices],
         "body_feature_names":   list(feat_names),
         "body_scaler":          body_scaler,    # vector_norm or standardize; carries its own indices
+        "use_next_wingbeat":     bool(use_next),
         "duration_standardizer": {"mu": dur_mu, "sigma": dur_sigma, "space": "log"},
         "inferred_latent_dim":   int(inferred_latent_dim),
         "n_wings":               int(n_wings),
@@ -690,6 +696,7 @@ def main():
         "body_feature_indices":  best_overall_extras["body_feature_indices"],
         "body_feature_names":    best_overall_extras["body_feature_names"],
         "body_scaler":           best_overall_extras["body_scaler"],
+        "use_next_wingbeat":     bool(best_overall_extras.get("use_next_wingbeat", True)),
         "duration_standardizer": best_overall_extras["duration_standardizer"],
         "best_val_loss":         best_overall_extras["best_val_loss"],
         "best_val_latent_mse":   best_overall_extras["best_val_latent_mse"],

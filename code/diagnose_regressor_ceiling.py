@@ -55,16 +55,24 @@ def _scaled_inputs(
     feature_set: str | None = None,
     body_feature_indices: list[int] | None = None,
     scaler_type: str | None = None,
+    include_next: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return (X_train, X_val, y_train, y_val) with inputs selected + scaled exactly
-    as in training: the chosen feature set is selected from both the current and next
-    body_means, with the scaler fit on the train current-wingbeat selected channels."""
+    as in training: the chosen feature set is selected from the current (and, when
+    include_next, next) body_means, with the scaler fit on the train current-wingbeat
+    selected channels."""
     tr, vl = splits["train_idx"], splits["val_idx"]
     indices, _ = resolve_feature_set(feature_set, body_feature_indices)
     scaler_type = scaler_type or default_scaler_type(indices)
     body_scaler = _fit_body_scaler(splits["body_means"][tr], indices, scaler_type)
-    X = apply_body_scaler_np(splits["body_means"], splits["next_body_means"], body_scaler)
+    X = apply_body_scaler_np(splits["body_means"], splits["next_body_means"], body_scaler,
+                             include_next=include_next)
     y = splits["target_latents"].astype(np.float32)
+    # single_wing carries a per-wingbeat (N, 2, D) latent (left, right); flatten to
+    # (N, 2D) — the exact target the regressor's MSE optimizes — so the 2-D ridge/kNN/
+    # R² machinery below is representation-agnostic. 'sa' stays (N, D) untouched.
+    if y.ndim > 2:
+        y = y.reshape(y.shape[0], -1)
     return X[tr], X[vl], y[tr], y[vl]
 
 
@@ -156,15 +164,21 @@ def main() -> None:
                         "Restrict inputs to compare the achievable ceiling across feature views.")
     p.add_argument("--body_feature_indices", type=int, nargs="+", default=None,
                    help="Explicit body-channel indices (overrides --feature_set).")
+    p.add_argument("--current_only", action="store_true",
+                   help="Use only the current wingbeat's body kinematics (drop the "
+                        "next-wingbeat half), matching a use_next_wingbeat=false regressor.")
     args = p.parse_args()
 
     ae_dir = _resolve_ae_model_dir(args.autoencoder_dir)
     splits = _load_split(args.dataset_path, os.path.join(ae_dir, "val_indices.json"))
     indices, feat_names = resolve_feature_set(args.feature_set, args.body_feature_indices)
-    Xtr, Xval, ytr, yval = _scaled_inputs(splits, args.feature_set, args.body_feature_indices)
+    include_next = not args.current_only
+    Xtr, Xval, ytr, yval = _scaled_inputs(splits, args.feature_set, args.body_feature_indices,
+                                          include_next=include_next)
     print(f"Dataset:     {args.dataset_path}")
     print(f"AE split:    {ae_dir}")
     print(f"Feature set: {feat_names} (indices {indices})")
+    print(f"Window:      {'current+next' if include_next else 'current-only'} wingbeat(s)")
     print(f"Train/val:   {len(Xtr)} / {len(Xval)}   input_dim={Xtr.shape[1]}  latent_dim={ytr.shape[1]}")
     print()
 

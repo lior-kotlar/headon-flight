@@ -65,6 +65,7 @@ class BodyToWingbeat(nn.Module):
         min_duration: int = 2,
         representation: str = "sa",
         template3: np.ndarray | None = None,
+        include_next: bool = True,
     ):
         super().__init__()
         self.regressor = regressor
@@ -89,11 +90,17 @@ class BodyToWingbeat(nn.Module):
         self.dur_mu       = float(dur_mu)
         self.dur_sigma    = float(dur_sigma)
         self.min_duration = int(min_duration)
+        # Temporal window the regressor was trained with: True → input is [current, next];
+        # False → current wingbeat only (next_body_mean unused). Matched to the checkpoint.
+        self.include_next = bool(include_next)
 
     def scale_body(self, body_mean: torch.Tensor, next_body_mean: torch.Tensor) -> torch.Tensor:
-        """Both inputs: (B, n_body_channels). Selects body_indices from each half, scales
-        them ((x - offset) / scale), and concatenates → (B, 2 * len(indices))."""
-        scaled_curr = (body_mean.index_select(-1, self.body_indices)      - self.body_offset) / self.body_scale
+        """Both inputs: (B, n_body_channels). Selects body_indices, scales ((x - offset)
+        / scale), and — when include_next — concatenates the next half → (B, 2*k); else
+        returns the current half only → (B, k)."""
+        scaled_curr = (body_mean.index_select(-1, self.body_indices) - self.body_offset) / self.body_scale
+        if not self.include_next:
+            return scaled_curr
         scaled_next = (next_body_mean.index_select(-1, self.body_indices) - self.body_offset) / self.body_scale
         return torch.cat([scaled_curr, scaled_next], dim=-1)
 
@@ -231,6 +238,8 @@ def load_body_to_wingbeat(
     body_scale   = torch.from_numpy(scale)
     dur_mu       = float(r_ckpt["duration_standardizer"]["mu"])
     dur_sigma    = float(r_ckpt["duration_standardizer"]["sigma"])
+    # Old checkpoints (pre-flag) were always current+next → default True.
+    include_next = bool(r_ckpt.get("use_next_wingbeat", True))
 
     return BodyToWingbeat(
         regressor, ae,
@@ -238,6 +247,7 @@ def load_body_to_wingbeat(
         dur_mu, dur_sigma,
         representation = representation,
         template3      = template3,
+        include_next   = include_next,
     ).to(device)
 
 

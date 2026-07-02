@@ -509,26 +509,85 @@ def default_color_features(F: torch.Tensor) -> dict[str, np.ndarray]:
     return feats
 
 
-def load_single_wing_dataset(path: str, device: str) -> tuple[torch.Tensor, dict[str, np.ndarray]]:
+# Single-wing golden template (physical radians) needed to reconstruct raw wing angles
+# from the stored template-residual samples; φ residuals are stored divided by π
+# (SINGLE_WING_PHYSICAL_SCALE[0]) — see transform_data.build_single_wing_fixed_len_dataset.
+DEFAULT_SINGLE_WING_TEMPLATE = "data/analysis/golden_template_single_wing.npy"
+_PHI_SCALE = float(np.pi)
+
+
+def load_single_wing_template(path: str) -> np.ndarray | None:
+    """Load the single-wing golden template (R, 3) in physical radians, or None if absent.
+
+    Used to reconstruct physical wing angles from the stored template-residual samples
+    (see wingbeat_phi_amplitude). Returns None (with a warning) when the file is missing
+    so callers can fall back to the unitless residual amplitude rather than crash.
+    """
+    if not os.path.exists(path):
+        print(f"[ddm] WARNING: single-wing template {path!r} not found; phi amplitude will be the "
+              f"unitless residual peak-to-peak, NOT physical degrees.", flush=True)
+        return None
+    return np.asarray(np.load(path), dtype=np.float32)
+
+
+def wingbeat_phi_amplitude(
+    wingbeats: np.ndarray,
+    template3: np.ndarray | None = None,
+    scale: float = _PHI_SCALE,
+) -> np.ndarray:
+    """Per-wingbeat physical stroke amplitude (φ peak-to-peak) in DEGREES.
+
+    The stored single-wing φ channel is not the raw stroke angle: it is a residual
+    against the phase-matched golden template, divided by π (see
+    transform_data.build_single_wing_fixed_len_dataset). Peak-to-peak of the raw channel
+    would therefore measure deviation from the *average* beat, not the physical stroke
+    sweep. To recover the true amplitude we undo both transforms — multiply by `scale`
+    (=π, SINGLE_WING_PHYSICAL_SCALE[0]) and add the template back — then take
+    (max_t φ − min_t φ) and convert radians → degrees (the standard stroke amplitude).
+
+    wingbeats : (N, C, T) stored single-wing samples (channel 0 = φ residual / π).
+    template3 : (R, C) golden template in physical radians; its φ column is cubic-resampled
+                onto the T-sample phase grid and added back. If None, returns the unitless
+                residual peak-to-peak instead (deviation-from-template swing, not degrees).
+    """
+    phi = np.asarray(wingbeats, dtype=np.float32)[:, 0, :]            # (N, T) stored φ residual/π
+    if template3 is None:
+        return phi.max(axis=1) - phi.min(axis=1)                      # unitless residual swing (fallback)
+    from scipy.interpolate import interp1d
+    tmpl_phi = np.asarray(template3, dtype=np.float32)[:, 0]          # (R,) physical radians
+    matched = interp1d(np.linspace(0, 1, tmpl_phi.shape[0]), tmpl_phi,
+                       kind="cubic")(np.linspace(0, 1, phi.shape[1]))  # (T,) template on the sample grid
+    phi_phys = phi * scale + matched[None, :]                         # (N, T) reconstructed radians
+    return np.rad2deg(phi_phys.max(axis=1) - phi_phys.min(axis=1))    # degrees
+
+
+def load_single_wing_dataset(
+    path: str, device: str, template_path: str = DEFAULT_SINGLE_WING_TEMPLATE,
+) -> tuple[torch.Tensor, dict[str, np.ndarray]]:
     """Load real single-wing wingbeats to embed with the wing-only diffusion map.
 
     Reads the autoencoder dataset's `single_wing_wingbeats` (N, 3, T) — stroke φ,
     deviation θ, rotation ψ — which is the *only* thing that builds the embedding.
 
-    Returns (X, color_features). The colour features are post-hoc diagnostics that
-    never enter the metric: the per-wingbeat (yaw, pitch, roll) maneuver scores in
-    [0,1] (body-response proxies, to ask "does the wing-only embedding organise by
-    body response?"). Wing-angle quantities are deliberately NOT included — they are
-    derived from the same wing samples that build the embedding, so colouring by them
-    would be circular.
+    Returns (X, color_features). Most colour features are post-hoc body-response
+    diagnostics that never enter the metric: the per-wingbeat (yaw, pitch, roll)
+    maneuver scores in [0,1] (to ask "does the wing-only embedding organise by body
+    response?"). The full wing-angle *trajectories* are deliberately not overlaid —
+    colouring by them would be circular (they build the metric) — but
+    `phi_amplitude_deg`, a single coarse per-beat summary scalar (physical stroke
+    peak-to-peak, in degrees, reconstructed via `template_path`), is included on request
+    so you can ask "does the manifold organise by stroke amplitude?".
     """
     z = np.load(path, allow_pickle=True)
-    X = torch.from_numpy(np.asarray(z["single_wing_wingbeats"], dtype=np.float32)).to(device)
+    wingbeats = np.asarray(z["single_wing_wingbeats"], dtype=np.float32)   # (N, 3, T): φ, θ, ψ residual/scale
+    X = torch.from_numpy(wingbeats).to(device)
     scores = np.asarray(z["maneuver_scores"], dtype=np.float32)        # (N, 3): yaw, pitch, roll
+    template3 = load_single_wing_template(template_path)               # (R, 3) physical-radian golden template
     feats: dict[str, np.ndarray] = {
         "yaw_maneuver":   scores[:, 0],
         "pitch_maneuver": scores[:, 1],
         "roll_maneuver":  scores[:, 2],
+        "phi_amplitude_deg": wingbeat_phi_amplitude(wingbeats, template3),
     }
     return X, feats
 
@@ -540,6 +599,9 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Sparse wing-only Diffusion Map (PyTorch).")
     p.add_argument("--data", default="data/autoencoder_dataset/wingbeats_single_wing_L69.npz",
                    help="single-wing wingbeat .npz to embed; 'dummy' for random smoke-test data")
+    p.add_argument("--template", default=DEFAULT_SINGLE_WING_TEMPLATE,
+                   help="single-wing golden template .npy (physical radians) used to reconstruct the "
+                        "physical stroke amplitude for the phi_amplitude_deg colour feature")
     p.add_argument("--n", type=int, default=56624, help="number of dummy samples (--data dummy only)")
     p.add_argument("--channels", type=int, default=3)
     p.add_argument("--timesteps", type=int, default=69)
@@ -594,7 +656,7 @@ def main() -> None:
         color_features = default_color_features(F)
         print(f"[ddm] dummy data: X={tuple(X.shape)} (colour features: randn)", flush=True)
     else:
-        X, color_features = load_single_wing_dataset(args.data, device)
+        X, color_features = load_single_wing_dataset(args.data, device, args.template)
         print(f"[ddm] loaded {args.data}: X={tuple(X.shape)}  "
               f"colour features={list(color_features)}", flush=True)
 

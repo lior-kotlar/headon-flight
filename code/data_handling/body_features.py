@@ -132,14 +132,19 @@ def apply_body_scaler_np(
     body_means: np.ndarray,
     next_body_means: np.ndarray,
     scaler: dict,
+    include_next: bool = True,
 ) -> np.ndarray:
-    """Select + scale both halves of a full 12-d body input and concatenate.
+    """Select + scale the current body half, optionally concatenating the next half.
 
-    ``body_means`` / ``next_body_means``: ``(N, 12)`` each. Returns ``(N, 2*k)``
-    float32 where ``k = len(indices)``.
+    ``body_means`` / ``next_body_means``: ``(N, n_body_channels)`` each. Returns
+    ``(N, 2*k)`` when ``include_next`` (current + next wingbeat, the default), else
+    ``(N, k)`` (current wingbeat only), float32, where ``k = len(indices)``.
+    ``next_body_means`` is ignored when ``include_next=False`` (callers may pass it unused).
     """
     indices, offset, scale = scaler_to_offset_scale(scaler)
     idx = np.asarray(indices, dtype=np.int64)
     cur = (body_means[:, idx] - offset) / scale
+    if not include_next:
+        return cur.astype(np.float32)
     nxt = (next_body_means[:, idx] - offset) / scale
     return np.concatenate([cur, nxt], axis=1).astype(np.float32)
